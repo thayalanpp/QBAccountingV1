@@ -285,6 +285,39 @@ END
 GO
 
 -- ------------------------------------------------------------
+-- qb.LoadRuns: one row per run of the QuickBooks loader. Each run
+-- replaces a company's whole fiscal year (delete + reload in one
+-- transaction), so this is the history of which export is currently
+-- in the tables and what each reload changed.
+-- ------------------------------------------------------------
+IF OBJECT_ID('qb.LoadRuns', 'U') IS NULL
+BEGIN
+    CREATE TABLE qb.LoadRuns (
+        LoadRunID          INT IDENTITY(1,1) NOT NULL,
+        CompanyID          INT               NOT NULL,
+        FiscalYearEnd      SMALLINT          NOT NULL,  -- FY named by the year it ends (2025 = Sep 2024 - Aug 2025)
+        PeriodStart        DATE              NOT NULL,
+        PeriodEnd          DATE              NOT NULL,
+        SourceFile         NVARCHAR(400)     NULL,
+        Status             NVARCHAR(30)      NOT NULL,  -- 'Loaded' | 'Loaded (partial)' | 'Aborted'
+        EntriesDeleted     INT               NOT NULL CONSTRAINT DF_LoadRuns_ED DEFAULT (0),
+        LinesDeleted       INT               NOT NULL CONSTRAINT DF_LoadRuns_LD DEFAULT (0),
+        EntriesWritten     INT               NOT NULL CONSTRAINT DF_LoadRuns_EW DEFAULT (0),
+        LinesWritten       INT               NOT NULL CONSTRAINT DF_LoadRuns_LW DEFAULT (0),
+        SectionsLoaded     INT               NOT NULL CONSTRAINT DF_LoadRuns_SL DEFAULT (0),
+        SectionsSkipped    INT               NOT NULL CONSTRAINT DF_LoadRuns_SS DEFAULT (0),
+        RowsOutsidePeriod  INT               NOT NULL CONSTRAINT DF_LoadRuns_ROP DEFAULT (0),
+        Notes              NVARCHAR(400)     NULL,
+        RunAt              DATETIME2         NOT NULL CONSTRAINT DF_LoadRuns_RunAt DEFAULT (SYSUTCDATETIME()),
+        CONSTRAINT PK_LoadRuns PRIMARY KEY (LoadRunID),
+        CONSTRAINT FK_LoadRuns_Companies FOREIGN KEY (CompanyID) REFERENCES qb.Companies(CompanyID)
+    );
+
+    CREATE INDEX IX_LoadRuns_Company_FY ON qb.LoadRuns(CompanyID, FiscalYearEnd, RunAt);
+END
+GO
+
+-- ------------------------------------------------------------
 -- fin.AccountLink: the bridge. Links a real-world account
 -- (fin.Accounts - a Visa card, a bank account) to the QuickBooks
 -- ledger account that tracks it, per company. Four rows today.

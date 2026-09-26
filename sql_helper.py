@@ -26,6 +26,7 @@ First-time setup:
 """
 
 import os
+import re
 import argparse
 
 import pandas as pd
@@ -96,7 +97,10 @@ def ensure_schema(engine, schema_path=SCHEMA_PATH):
 
     # SQL Server's GO batch separator isn't valid T-SQL for a single
     # execute() call, so split on it and run each batch separately.
-    batches = [b.strip() for b in script.split("\nGO") if b.strip()]
+    # Split only on lines that are exactly "GO" (any case, optional
+    # whitespace) - a plain split on "\nGO" would also break on lines
+    # that merely start with GO, e.g. GOTO or a column named GOAL.
+    batches = [b.strip() for b in re.split(r"(?im)^[ \t]*GO[ \t]*;?[ \t]*$", script) if b.strip()]
 
     with engine.begin() as conn:
         for batch in batches:

@@ -15,15 +15,21 @@ So instead of hardcoding column indices, every parser here first finds
 the header row and maps column name -> column index from it, then walks
 indentation to reconstruct the account hierarchy live.
 
-Auto-apply rule (per the project's own decision): a section only gets
-loaded if its own running balance re-derives cleanly from the parsed
-rows. If it doesn't, that section is skipped and reported - nothing
-partial gets written for it. New Company / ChartOfAccounts / Class rows
-are created automatically as they're encountered (that's just normal
-dimension growth, not a structural schema change).
+Reload model: every run REPLACES one company's fiscal year. All of that
+company's journal entries dated inside the fiscal year are deleted and
+the year is re-inserted from the export, in a single transaction - so
+the loader can be rerun as often as the bookkeeper re-exports, and a
+failure midway leaves the previous load untouched. Each run is recorded
+in qb.LoadRuns. See the "Fiscal-year reload" section below.
 
-JournalEntry grouping (tested against all three companies' real files,
-see _find_or_create_journal_entry): this report shows every transaction
+Validation gate: a section is only loadable if its own running balance
+re-derives cleanly from the parsed rows. By default, if ANY section
+fails, the whole reload is refused and nothing changes; --allow-partial
+reloads anyway and leaves the failed accounts empty for that year. New
+Company / ChartOfAccounts / Class rows are created automatically as
+they're encountered (normal dimension growth, not a schema change).
+
+JournalEntry grouping (tested against all three companies' real files): this report shows every transaction
 once per account it touches, with no stable transaction ID, so the
 loader has to infer which rows belong to the same real-world transaction.
 RefNum (cheque #, journal entry #) is the only field QuickBooks keeps
@@ -41,45 +47,21 @@ its own one-line JournalEntry rather than a guessed grouping. This only
 affects how rows are grouped for GL drill-down; every row's dollar
 amount still lands under the correct ChartAccountID either way, and
 validate_section()'s per-account running-balance check - the actual
-auto-apply gate - is unaffected.
+load gate - is unaffected.
 """
 
 import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Optional
 
 import pandas as pd
-from sqlalchemy import create_engine, text
-from dotenv import load_dotenv
+from sqlalchemy import text
 
-load_dotenv()
-
-_engine = None
-
-
-def get_engine():
-    global _engine
-    if _engine is not None:
-        return _engine
-
-    server = os.getenv("DB_SERVER")
-    database = os.getenv("DB_NAME")
-    driver = os.getenv("DB_DRIVER", "ODBC Driver 18 for SQL Server")
-    trusted = os.getenv("DB_TRUSTED", "yes").lower() == "yes"
-
-    if not server or not database:
-        raise RuntimeError("DB_SERVER and DB_NAME must be set before qb_loader can connect.")
-
-    if trusted:
-        odbc_str = f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};Trusted_Connection=yes;TrustServerCertificate=yes;"
-    else:
-        user, password = os.getenv("DB_USER"), os.getenv("DB_PASSWORD")
-        odbc_str = f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};UID={user};PWD={password};TrustServerCertificate=yes;"
-
-    _engine = create_engine(f"mssql+pyodbc:///?odbc_connect={odbc_str}", fast_executemany=True)
-    return _engine
+# One shared engine/connection definition for the whole project.
+from sql_helper import get_engine  # noqa: F401  (re-exported for run_qb_load.py)
 
 
 # =====================================================================
@@ -315,9 +297,70 @@ def validate_section(section: Section, tolerance: float = 0.01) -> ValidationRes
 
 
 # =====================================================================
-# Dimension get-or-create (auto-applied - these are just new data,
-# not structural schema changes)
+# Fiscal-year reload
+#
+# The loader works one (company, fiscal year) at a time and REPLACES
+# that year's ledger on every run: all qb.JournalEntries (and, via
+# ON DELETE CASCADE, their qb.JournalEntryLines) for the company dated
+# inside the fiscal year are deleted, then the year is reloaded from the
+# export - all inside ONE database transaction. If anything fails midway
+# the transaction rolls back and the previous load is left untouched.
+# Run it as many times as the bookkeeper re-exports; the result is
+# always exactly one copy of that year.
+#
+# Rows in the export dated outside the fiscal year are ignored (and
+# counted in the report), so an export that also covers the prior or
+# next year can't wipe out or duplicate a neighbouring year.
+#
+# Chart of accounts and classes are shared across years, so they are
+# upserted (never deleted).
 # =====================================================================
+
+@dataclass
+class FiscalPeriod:
+    fy_end_year: int
+    start: date
+    end: date
+
+    def __str__(self):
+        return f"FY ending {self.end:%b %d, %Y} ({self.start:%Y-%m-%d} to {self.end:%Y-%m-%d})"
+
+
+def fiscal_period(fy_end_year: int, start_month: int = 9) -> FiscalPeriod:
+    """
+    Fiscal years are named by the calendar year they END in.
+    With the default September start: fy_end_year=2025 -> 2024-09-01 .. 2025-08-31.
+    """
+    fy_end_year = int(fy_end_year)
+    start = date(fy_end_year - 1, start_month, 1) if start_month != 1 else date(fy_end_year, 1, 1)
+    next_start = date(start.year + 1, start.month, 1)
+    end = date.fromordinal(next_start.toordinal() - 1)
+    return FiscalPeriod(fy_end_year, start, end)
+
+
+def _to_date(v) -> Optional[date]:
+    if v is None:
+        return None
+    ts = pd.to_datetime(v, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return ts.date()
+
+
+# =====================================================================
+# Dimension get-or-create (auto-applied - these are just new data,
+# not structural schema changes). Committed BEFORE the reload
+# transaction so the reload itself only touches journal tables.
+# =====================================================================
+
+def get_company(engine, company_code):
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT CompanyID, FiscalYearStartMonth FROM qb.Companies WHERE CompanyCode = :c"),
+            {"c": company_code},
+        ).fetchone()
+    return (row[0], int(row[1])) if row else (None, 9)
+
 
 def get_or_create_company(engine, company_code, legal_name=None):
     with engine.begin() as conn:
@@ -326,6 +369,11 @@ def get_or_create_company(engine, company_code, legal_name=None):
             {"c": company_code},
         ).fetchone()
         if existing:
+            if legal_name:
+                conn.execute(
+                    text("UPDATE qb.Companies SET LegalName = :n WHERE CompanyID = :id AND LegalName <> :n"),
+                    {"n": legal_name, "id": existing[0]},
+                )
             return existing[0]
         result = conn.execute(
             text("""INSERT INTO qb.Companies (CompanyCode, LegalName)
@@ -336,23 +384,24 @@ def get_or_create_company(engine, company_code, legal_name=None):
         return result[0]
 
 
-def get_or_create_class(engine, company_id, class_name):
-    if not class_name:
-        return None
+def resolve_classes(engine, company_id, class_names) -> dict:
+    """Returns {ClassName: ClassID}, creating any that don't exist yet."""
+    out = {}
     with engine.begin() as conn:
-        existing = conn.execute(
-            text("SELECT ClassID FROM qb.Classes WHERE CompanyID = :cid AND ClassName = :name"),
-            {"cid": company_id, "name": class_name},
-        ).fetchone()
-        if existing:
-            return existing[0]
-        result = conn.execute(
-            text("""INSERT INTO qb.Classes (CompanyID, ClassName)
-                     OUTPUT INSERTED.ClassID
-                     VALUES (:cid, :name)"""),
-            {"cid": company_id, "name": class_name},
-        ).fetchone()
-        return result[0]
+        for name in sorted(set(n for n in class_names if n)):
+            row = conn.execute(
+                text("SELECT ClassID FROM qb.Classes WHERE CompanyID = :cid AND ClassName = :name"),
+                {"cid": company_id, "name": name},
+            ).fetchone()
+            if row is None:
+                row = conn.execute(
+                    text("""INSERT INTO qb.Classes (CompanyID, ClassName)
+                             OUTPUT INSERTED.ClassID
+                             VALUES (:cid, :name)"""),
+                    {"cid": company_id, "name": name},
+                ).fetchone()
+            out[name] = row[0]
+    return out
 
 
 def load_chart_of_accounts(engine, company_id, rows: list[ChartAccountRow]):
@@ -399,6 +448,11 @@ def load_chart_of_accounts(engine, company_id, rows: list[ChartAccountRow]):
     return number_to_id
 
 
+def _account_number_from_label(account_label):
+    m = re.match(r"^([\w.]+)\s*·", account_label)
+    return m.group(1) if m else account_label
+
+
 def _resolve_chart_account_id(engine, company_id, account_label, cache):
     """
     account_label looks like "1010 · Bank - Scotia A/C 26492 0068810".
@@ -406,8 +460,7 @@ def _resolve_chart_account_id(engine, company_id, account_label, cache):
     by load_chart_of_accounts, falling back to a live query for accounts
     that only ever appear in the detail export, not the Account Listing).
     """
-    m = re.match(r"^([\w.]+)\s*·", account_label)
-    number = m.group(1) if m else account_label
+    number = _account_number_from_label(account_label)
     if number in cache:
         return cache[number]
 
@@ -435,61 +488,28 @@ def _resolve_chart_account_id(engine, company_id, account_label, cache):
         return result[0]
 
 
-def _find_or_create_journal_entry(conn, company_id, txn_type, txn_date, ref_num, name, memo,
-                                   occurrence_rank, source_file):
-    """
-    Groups rows into one JournalEntry only when there's a signal reliable
-    enough to trust: a QuickBooks-assigned RefNum (cheque #, journal entry
-    #). RefNum is the only field this export keeps consistent across every
-    account a transaction touches. Name/Memo/Class are NOT reliably
-    consistent across accounts for the same real-world transaction here -
-    testing against all three companies' real files found bank deposits
-    with a generic "Deposit" memo on the bank side but itemized per-payment
-    memos on the income side, and payroll cheques whose liability/expense
-    legs can post multiple separate lines to the very same account. Text
-    heuristics over those fields produced both false merges (unrelated
-    transactions collapsed together) and false splits (one transaction's
-    own lines scattered across separate "entries") in testing. So: RefNum
-    present -> reuse/merge into the existing entry for that
-    (company, type, date, ref). RefNum absent -> always insert a new,
-    one-line entry; never guess a grouping. Either way every row's dollar
-    amount lands under the correct ChartAccountID - validate_section()'s
-    per-account running-balance check is what actually gates loading, and
-    is unaffected by this. occurrence_rank is stored for reference only.
-    """
-    if ref_num:
-        existing = conn.execute(
-            text("""SELECT JournalEntryID FROM qb.JournalEntries
-                     WHERE CompanyID = :cid AND TxnType = :ttype AND TxnDate = :tdate
-                       AND RefNum = :ref"""),
-            {"cid": company_id, "ttype": txn_type, "tdate": txn_date, "ref": ref_num},
-        ).fetchone()
-        if existing:
-            return existing[0]
+# =====================================================================
+# Plan: parse + validate + filter to the fiscal year, no DB writes
+# =====================================================================
 
-    result = conn.execute(
-        text("""INSERT INTO qb.JournalEntries (CompanyID, TxnType, TxnDate, RefNum, Name, Memo, OccurrenceRank, SourceFile)
-                 OUTPUT INSERTED.JournalEntryID
-                 VALUES (:cid, :ttype, :tdate, :ref, :name, :memo, :rank, :src)"""),
-        {"cid": company_id, "ttype": txn_type, "tdate": txn_date,
-         "ref": ref_num, "name": name, "memo": memo, "rank": occurrence_rank, "src": source_file},
-    ).fetchone()
-    return result[0]
+@dataclass
+class LoadPlan:
+    period: FiscalPeriod
+    sections_ok: list = field(default_factory=list)       # [(Section, [TxnLine in period])]
+    failures: list = field(default_factory=list)          # validation failures (dicts)
+    rows_in_period: int = 0
+    rows_outside_period: int = 0
+    rows_bad_date: int = 0
 
 
-def load_transactions(engine, company_id, sections: list[Section], source_file, coa_cache):
-    """
-    The auto-apply gate: validates every section BEFORE writing anything.
-    Sections that fail validation are skipped and reported; valid ones
-    are loaded in full. Returns a report dict.
-    """
-    report = {"loaded_sections": 0, "skipped_sections": 0, "lines_written": 0, "failures": []}
-
+def build_plan(sections: list[Section], period: FiscalPeriod) -> LoadPlan:
+    plan = LoadPlan(period=period)
     for section in sections:
+        # Validate the WHOLE section (all dates) - the running balance only
+        # re-derives correctly over the full sequence of rows.
         result = validate_section(section)
         if not result.is_valid:
-            report["skipped_sections"] += 1
-            report["failures"].append({
+            plan.failures.append({
                 "account": section.account_label,
                 "row": result.first_mismatch_row,
                 "computed": result.computed_ending,
@@ -497,25 +517,48 @@ def load_transactions(engine, company_id, sections: list[Section], source_file, 
             })
             continue
 
-        chart_account_id = _resolve_chart_account_id(engine, company_id, section.account_label, coa_cache)
+        in_period = []
+        for r in section.rows:
+            d = _to_date(r.txn_date)
+            if d is None:
+                plan.rows_bad_date += 1
+            elif period.start <= d <= period.end:
+                r.txn_date = d
+                in_period.append(r)
+            else:
+                plan.rows_outside_period += 1
+        plan.rows_in_period += len(in_period)
+        if in_period:
+            plan.sections_ok.append((section, in_period))
+    return plan
 
-        with engine.begin() as conn:
-            for r in section.rows:
-                class_id = get_or_create_class(engine, company_id, r.class_name) if r.class_name else None
-                je_id = _find_or_create_journal_entry(
-                    conn, company_id, r.txn_type, r.txn_date, r.ref_num, r.name, r.memo,
-                    r.occurrence_rank, source_file
-                )
-                conn.execute(
-                    text("""INSERT INTO qb.JournalEntryLines (JournalEntryID, ChartAccountID, ClassID, Amount, LineMemo)
-                             VALUES (:je, :acct, :cls, :amt, :memo)"""),
-                    {"je": je_id, "acct": chart_account_id, "cls": class_id, "amt": r.amount, "memo": r.memo},
-                )
-                report["lines_written"] += 1
 
-        report["loaded_sections"] += 1
+def _count_existing(conn, company_id, period):
+    row = conn.execute(
+        text("""SELECT COUNT(DISTINCT je.JournalEntryID), COUNT(jel.LineID)
+                 FROM qb.JournalEntries je
+                 LEFT JOIN qb.JournalEntryLines jel ON jel.JournalEntryID = je.JournalEntryID
+                 WHERE je.CompanyID = :cid AND je.TxnDate BETWEEN :s AND :e"""),
+        {"cid": company_id, "s": period.start, "e": period.end},
+    ).fetchone()
+    return int(row[0]), int(row[1])
 
-    return report
+
+def _log_run(conn, company_id, period, source_file, status, report):
+    conn.execute(
+        text("""INSERT INTO qb.LoadRuns
+                    (CompanyID, FiscalYearEnd, PeriodStart, PeriodEnd, SourceFile, Status,
+                     EntriesDeleted, LinesDeleted, EntriesWritten, LinesWritten,
+                     SectionsLoaded, SectionsSkipped, RowsOutsidePeriod, Notes)
+                 VALUES (:cid, :fy, :s, :e, :src, :status,
+                         :ed, :ld, :ew, :lw, :sl, :ss, :rop, :notes)"""),
+        {"cid": company_id, "fy": period.fy_end_year, "s": period.start, "e": period.end,
+         "src": source_file, "status": status,
+         "ed": report.get("entries_deleted", 0), "ld": report.get("lines_deleted", 0),
+         "ew": report.get("entries_written", 0), "lw": report.get("lines_written", 0),
+         "sl": report.get("loaded_sections", 0), "ss": report.get("skipped_sections", 0),
+         "rop": report.get("rows_outside_period", 0), "notes": report.get("notes")},
+    )
 
 
 # =====================================================================
@@ -523,23 +566,130 @@ def load_transactions(engine, company_id, sections: list[Section], source_file, 
 # =====================================================================
 
 def load_company(engine, company_code, account_list_path, transaction_detail_path,
-                  legal_name=None, source_file_label=None):
-    company_id = get_or_create_company(engine, company_code, legal_name)
+                 fy_end_year, legal_name=None, source_file_label=None,
+                 allow_partial=False, dry_run=False):
+    """
+    Replace one company's ledger for one fiscal year with the contents
+    of the given exports.
+
+    allow_partial=False (default): if ANY account section fails its
+        running-balance check, nothing is changed and the old load stays.
+    allow_partial=True: reload anyway, leaving failed accounts with NO
+        rows for that year (they're listed in the report and LoadRuns).
+    dry_run=True: parse, validate and report what would happen; no writes.
+    """
+    source_file = source_file_label or os.path.basename(transaction_detail_path)
+
+    company_id, start_month = get_company(engine, company_code)
+    period = fiscal_period(fy_end_year, start_month)
+    print(f"📅 {company_code}: {period}")
 
     coa_rows = parse_account_list(account_list_path)
-    coa_cache = load_chart_of_accounts(engine, company_id, coa_rows)
-    print(f"✅ {company_code}: {len(coa_rows)} chart-of-accounts rows loaded")
-
     sections = parse_transaction_detail(transaction_detail_path)
-    report = load_transactions(
-        engine, company_id, sections,
-        source_file=source_file_label or os.path.basename(transaction_detail_path),
-        coa_cache=coa_cache,
-    )
-    print(f"✅ {company_code}: {report['loaded_sections']} account sections loaded "
-          f"({report['lines_written']} lines), {report['skipped_sections']} skipped")
-    for f in report["failures"]:
-        print(f"   ⚠️ SKIPPED {f['account']}: computed {f['computed']} vs stated {f['stated']} "
+    plan = build_plan(sections, period)
+
+    report = {
+        "loaded_sections": len(plan.sections_ok),
+        "skipped_sections": len(plan.failures),
+        "rows_outside_period": plan.rows_outside_period,
+        "failures": plan.failures,
+    }
+
+    print(f"   Parsed {len(coa_rows)} accounts, {len(sections)} account sections")
+    print(f"   Rows in FY: {plan.rows_in_period:,}   outside FY (ignored): {plan.rows_outside_period:,}"
+          + (f"   unreadable date: {plan.rows_bad_date:,}" if plan.rows_bad_date else ""))
+    for f in plan.failures:
+        print(f"   ⚠️ FAILED CHECK {f['account']}: computed {f['computed']} vs stated {f['stated']} "
               f"(first mismatch around row {f['row']})")
 
+    # --- Safety stops (nothing has been written yet) ------------------
+    abort_reason = None
+    if plan.failures and not allow_partial:
+        abort_reason = (f"{len(plan.failures)} account section(s) failed the balance check - "
+                        f"nothing changed. Fix the export or rerun with --allow-partial.")
+    elif plan.rows_in_period == 0:
+        abort_reason = (f"no transactions in the export fall inside {period} - "
+                        f"wrong file or wrong --fy-end?")
+
+    if dry_run:
+        if company_id is not None:
+            with engine.connect() as conn:
+                e, l = _count_existing(conn, company_id, period)
+            print(f"   [dry run] would delete {e:,} entries / {l:,} lines currently in SQL for this FY")
+        else:
+            print("   [dry run] company not in SQL yet - nothing would be deleted")
+        print(f"   [dry run] {'WOULD ABORT: ' + abort_reason if abort_reason else 'would load OK'}")
+        report["status"] = "DryRun"
+        return company_id, report
+
+    company_id = get_or_create_company(engine, company_code, legal_name)
+
+    if abort_reason:
+        print(f"🛑 {company_code}: aborted - {abort_reason}")
+        report["status"] = "Aborted"
+        report["notes"] = abort_reason[:400]
+        with engine.begin() as conn:
+            _log_run(conn, company_id, period, source_file, "Aborted", report)
+        return company_id, report
+
+    # --- Dimensions (committed separately; safe to keep even on rollback)
+    coa_cache = load_chart_of_accounts(engine, company_id, coa_rows)
+    class_ids = resolve_classes(engine, company_id,
+                                (r.class_name for _, rows in plan.sections_ok for r in rows))
+    account_ids = {id(sec): _resolve_chart_account_id(engine, company_id, sec.account_label, coa_cache)
+                   for sec, _ in plan.sections_ok}
+
+    # --- The reload: delete the FY and re-insert, all-or-nothing -------
+    with engine.begin() as conn:
+        report["entries_deleted"], report["lines_deleted"] = _count_existing(conn, company_id, period)
+        conn.execute(
+            text("""DELETE FROM qb.JournalEntries
+                     WHERE CompanyID = :cid AND TxnDate BETWEEN :s AND :e"""),
+            {"cid": company_id, "s": period.start, "e": period.end},
+        )
+
+        ref_entries = {}   # (TxnType, TxnDate, RefNum) -> JournalEntryID, for this load only
+        lines = []
+        entries_written = 0
+
+        for section, rows in plan.sections_ok:
+            chart_account_id = account_ids[id(section)]
+            for r in rows:
+                key = (r.txn_type, r.txn_date, r.ref_num)
+                je_id = ref_entries.get(key) if r.ref_num else None
+                if je_id is None:
+                    je_id = conn.execute(
+                        text("""INSERT INTO qb.JournalEntries
+                                    (CompanyID, TxnType, TxnDate, RefNum, Name, Memo, OccurrenceRank, SourceFile)
+                                 OUTPUT INSERTED.JournalEntryID
+                                 VALUES (:cid, :ttype, :tdate, :ref, :name, :memo, :rank, :src)"""),
+                        {"cid": company_id, "ttype": r.txn_type, "tdate": r.txn_date, "ref": r.ref_num,
+                         "name": r.name, "memo": r.memo, "rank": r.occurrence_rank, "src": source_file},
+                    ).fetchone()[0]
+                    entries_written += 1
+                    if r.ref_num:
+                        ref_entries[key] = je_id
+                lines.append({"je": je_id, "acct": chart_account_id,
+                              "cls": class_ids.get(r.class_name) if r.class_name else None,
+                              "amt": round(r.amount, 2), "memo": r.memo})
+
+        if lines:
+            conn.execute(
+                text("""INSERT INTO qb.JournalEntryLines (JournalEntryID, ChartAccountID, ClassID, Amount, LineMemo)
+                         VALUES (:je, :acct, :cls, :amt, :memo)"""),
+                lines,
+            )
+
+        report["entries_written"] = entries_written
+        report["lines_written"] = len(lines)
+        status = "Loaded (partial)" if plan.failures else "Loaded"
+        report["status"] = status
+        if plan.failures:
+            report["notes"] = ("Skipped: " + "; ".join(f["account"] for f in plan.failures))[:400]
+        _log_run(conn, company_id, period, source_file, status, report)
+
+    print(f"✅ {company_code}: replaced FY{period.fy_end_year} - removed {report['entries_deleted']:,} entries / "
+          f"{report['lines_deleted']:,} lines, wrote {report['entries_written']:,} entries / "
+          f"{report['lines_written']:,} lines from {report['loaded_sections']} account sections"
+          + (f" ({report['skipped_sections']} skipped)" if plan.failures else ""))
     return company_id, report

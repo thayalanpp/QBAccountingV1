@@ -2,8 +2,6 @@ import pandas as pd
 import os
 
 # --- CONFIGURATION ---
-INPUT_FILE = "TD_AEROPLAN_VISA_INFINITE_PRIVILEGE_6761_Apr_07-2025_Analysis.xlsx"
-OUTPUT_FILE = "Reconciliation_Report.xlsx"
 OUTPUT_DIR = "output_reports"
 
 
@@ -77,10 +75,23 @@ def run_stage2_reconciliation(input_excel):
     return recon_df
 
 
-# Execution
+# Execution (standalone): reconcile an existing *_Analysis.xlsx
+#   python stage2_reconciliation.py output_reports/<statement>_Analysis.xlsx
+# Normally this runs inside reflect0.py's validation node instead.
 if __name__ == "__main__":
-    master_file = os.path.join(OUTPUT_DIR, INPUT_FILE)
+    import sys
+
+    if len(sys.argv) != 2:
+        print("Usage: python stage2_reconciliation.py <path to *_Analysis.xlsx>")
+        sys.exit(1)
+
+    master_file = sys.argv[1]
+    if not os.path.exists(master_file):
+        # Allow just the file name, looked up in output_reports/
+        master_file = os.path.join(OUTPUT_DIR, sys.argv[1])
+
     if os.path.exists(master_file):
         run_stage2_reconciliation(master_file)
     else:
-        print(f"❌ Error: {master_file} not found.")
+        print(f"❌ Error: {sys.argv[1]} not found.")
+        sys.exit(1)
