@@ -1,0 +1,16 @@
+# Environments & IDE
+.venv/
+venv/
+.idea/
+__pycache__/
+
+# API Keys
+.env
+
+# Accounting / Client Data
+input_pdfs/
+output_reports/
+debug_logs/
+*.xlsx
+*.pdf
+*.db
