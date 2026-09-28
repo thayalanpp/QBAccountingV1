@@ -56,6 +56,7 @@ class CardStatement(BaseModel):
     period_end: date
     summary: StatementSummary
     transactions: list[Transaction] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)     # anything the reader decided that a person should know
 
     def total_by_type(self, txn_type: TxnType) -> float:
         return round(sum(t.amount for t in self.transactions if t.txn_type == txn_type), 2)

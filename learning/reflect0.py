@@ -30,7 +30,8 @@ OUTPUT_DIR = "output_reports"
 # Set SAVE_TO_SQL=true in your .env once sql/schema.sql has been reviewed
 # and your DB_* connection variables are filled in. Until then the pipeline
 # behaves exactly as before (Excel only).
-SAVE_TO_SQL = os.getenv("SAVE_TO_SQL", "false").lower() == "true"
+SAVE_TO_SQL = "false"
+# os.getenv("SAVE_TO_SQL", "false").lower() == "true"
 
 # Every statement processed by this file today is this one Visa account.
 # When the Bank/QuickBooks pipelines are added, this becomes a per-source

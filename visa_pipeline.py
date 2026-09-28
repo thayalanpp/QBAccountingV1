@@ -12,14 +12,14 @@ through a LangGraph pipeline:
 
 Status today:
     read_pdf           REAL  - td_visa_parser.py (Python, no AI)
-    validate           STUB  - next step to build (statement_validator.py)
+    validate           REAL  - statement_validator.py (10 arithmetic/date checks)
+    save_to_sql        REAL  - visa_sql.py -> fin.Statements / fin.Transactions (rerun-safe)
+    reconcile_with_qb  REAL  - qb_matcher.py: statement vs the QB account(s) in fin.AccountLink
     ai_fallback        STUB  - OpenAI / Gemini, once API keys are in .env
-    save_to_sql        STUB  - fin.* tables, rerun-safe
-    reconcile_with_qb  STUB  - statement period vs QB account 22200
     needs_review       STUB  - will record the problem for a person to look at
 
-Each stub prints what it would do and passes the statement along, so the
-whole flow runs end to end now and each step can be filled in on its own.
+Only statements that pass validation are saved. Statements are processed
+oldest first so each one can be chained to the one before it.
 
 Usage:
     python visa_pipeline.py                      # all PDFs for FISCAL_YEAR_END
@@ -34,13 +34,17 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
 
+import visa_sql
+from qb_matcher import MAX_DAYS_APART, match_statement
+from sql_helper import ensure_schema, get_engine
+from statement_validator import ValidationResult, validate_statement
 from td_visa_parser import TDVisaParseError, parse_td_visa
-from visa_models import CardStatement, TxnType
+from visa_models import CardStatement
 
 # ---------------------------------------------------------------------
 # Configuration
@@ -48,6 +52,14 @@ from visa_models import CardStatement, TxnType
 FISCAL_YEAR_END = 2025
 VISA_FOLDER = r"C:\NM\{year}yearend\visa"          # {year} filled from FISCAL_YEAR_END / --fy-end
 PARSED_OUTPUT_FOLDER = os.path.join("output_reports", "visa")   # parsed JSON, for inspection (gitignored)
+
+# Which fin.Accounts row each card (by last four digits) belongs to. The name must
+# match the one used in fin.AccountLink (TD Visa -> dntl 22200).
+CARD_ACCOUNTS = {
+    "6761": {"name": "TD Aeroplan Visa Infinite Privilege", "institution": "TD"},
+}
+
+ENGINE = None   # set once in main(); the steps below share it
 
 
 # ---------------------------------------------------------------------
@@ -59,6 +71,10 @@ class VisaState(TypedDict):
     extractor: Optional[str]        # which extractor produced `statement`
     error: Optional[str]            # why the last step failed, if it did
     validation_passed: Optional[bool]
+    validation: Optional[ValidationResult]
+    account_id: Optional[int]       # fin.Accounts
+    statement_id: Optional[int]     # fin.Statements, once saved
+    recon: Optional[dict]           # QB reconciliation counts, for the summary
     status: str                     # final outcome shown in the summary
     log: list[str]                  # one line per step, for the run summary
 
@@ -88,18 +104,34 @@ def read_pdf(state: VisaState) -> dict:
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(stmt.model_dump_json(indent=2))
 
-    return {"statement": stmt, "extractor": stmt.extractor, "error": None, "log": _log(state, msg)}
+    log = _log(state, msg)
+    for n in stmt.notes:
+        log = _log({**state, "log": log}, f"   note: {n}")
+    return {"statement": stmt, "extractor": stmt.extractor, "error": None, "log": log}
+
+
+def _card_account(stmt: CardStatement) -> Optional[dict]:
+    return CARD_ACCOUNTS.get(stmt.card_last_four or "")
 
 
 def validate(state: VisaState) -> dict:
-    """STUB: will check summary math, totals by type, posting dates, and chaining to the previous statement."""
+    """REAL: arithmetic and date checks, plus chaining to the previous statement already in SQL."""
     stmt = state["statement"]
-    # Preview only (not the real validator): the totals the validator will compare.
-    preview = (f"purchases {stmt.total_by_type(TxnType.PURCHASE):,.2f} vs printed {stmt.summary.purchases:,.2f}, "
-               f"payments+refunds {-(stmt.total_by_type(TxnType.PAYMENT) + stmt.total_by_type(TxnType.REFUND)):,.2f} "
-               f"vs printed {stmt.summary.payments_and_credits:,.2f}")
-    return {"validation_passed": True,
-            "log": _log(state, f"🔢 validate: [STUB - passes everything] {preview}")}
+    card = _card_account(stmt)
+    if card is None:
+        return {"validation_passed": False, "error": f"card ending {stmt.card_last_four} not in CARD_ACCOUNTS",
+                "log": _log(state, f"🔢 validate: ❌ card ending {stmt.card_last_four} is not set up in CARD_ACCOUNTS")}
+
+    account_id = visa_sql.find_account_id(ENGINE, card["name"])
+    prev_balance = visa_sql.get_statement_new_balance(ENGINE, account_id, stmt.previous_statement_date)
+    result = validate_statement(stmt, prev_balance, f"{stmt.previous_statement_date} statement")
+
+    for check in result.checks:
+        if not check.passed or check.skipped:
+            print(f"      {check}")
+    log = _log(state, f"🔢 validate: {'✅' if result.passed else '❌'} {result.short()}")
+    return {"validation_passed": result.passed, "validation": result, "account_id": account_id,
+            "error": None if result.passed else f"validation: {result.short()}", "log": log}
 
 
 def ai_fallback(state: VisaState) -> dict:
@@ -115,14 +147,43 @@ def needs_review(state: VisaState) -> dict:
 
 
 def save_to_sql(state: VisaState) -> dict:
-    """STUB: will write fin.Statements / fin.Transactions (replace-on-rerun) and log the run."""
-    return {"log": _log(state, "💾 save_to_sql: [STUB] would save statement + transactions")}
+    """REAL: write the statement and its lines to fin.* (replaces a previous run of the same statement)."""
+    stmt = state["statement"]
+    card = _card_account(stmt)
+    account_id = visa_sql.get_or_create_account(ENGINE, card["name"], card["institution"], stmt.card_last_four)
+    statement_id = visa_sql.save_statement(ENGINE, account_id, stmt, state["validation"])
+    return {"account_id": account_id, "statement_id": statement_id,
+            "log": _log(state, f"💾 save_to_sql: StatementID {statement_id}, {len(stmt.transactions)} transactions")}
 
 
 def reconcile_with_qb(state: VisaState) -> dict:
-    """STUB: will compare this statement period against the linked QB account (dntl 22200)."""
-    return {"status": "Read OK (later steps are stubs)",
-            "log": _log(state, "🔗 reconcile_with_qb: [STUB] would compare with QuickBooks")}
+    """REAL: match statement lines to the linked QuickBooks account(s) and itemize every difference."""
+    stmt, statement_id = state["statement"], state["statement_id"]
+    links = visa_sql.get_qb_links(ENGINE, state["account_id"])
+    if not links:
+        return {"status": "Balanced · no QB link",
+                "log": _log(state, "🔗 reconcile_with_qb: no fin.AccountLink row for this card - skipped")}
+
+    window_start = stmt.period_start - timedelta(days=MAX_DAYS_APART)
+    window_end = stmt.period_end + timedelta(days=MAX_DAYS_APART)
+    stmt_lines = visa_sql.load_statement_lines(ENGINE, statement_id)
+    qb_lines = visa_sql.load_qb_candidates(ENGINE, [l["chart_account_id"] for l in links],
+                                           window_start, window_end, statement_id)
+    result = match_statement(stmt_lines, qb_lines, stmt.period_start, stmt.period_end)
+    visa_sql.save_qb_recon(ENGINE, statement_id, links, result, window_start, window_end)
+
+    for s_line in result.statement_only:
+        print(f"      card only : {s_line.posting_date}  {s_line.amount:>11,.2f}  {s_line.description[:45]}")
+    for q in result.qb_only:
+        label = " ".join(str(x) for x in (q.txn_type, q.ref_num, q.name or q.memo) if x)
+        print(f"      QB only   : {q.txn_date}  {q.amount:>11,.2f}  {label[:45]}")
+
+    recon = {"matched": len(result.matched), "card_only": len(result.statement_only),
+             "qb_only": len(result.qb_only), "variance": result.variance}
+    msg = (f"🔗 reconcile_with_qb ({', '.join(l['label'] for l in links)}): "
+           f"{recon['matched']} matched, {recon['card_only']} card only, {recon['qb_only']} QB only, "
+           f"variance {result.variance:,.2f}")
+    return {"recon": recon, "status": "Balanced · reconciled", "log": _log(state, msg)}
 
 
 # ---------------------------------------------------------------------
@@ -204,24 +265,33 @@ def main():
         print("Nothing to process.")
         sys.exit(1)
 
+    global ENGINE
+    ENGINE = get_engine()
+    ensure_schema(ENGINE)
+
     results = []
     for i, pdf_path in enumerate(pdfs, start=1):
         print(f"\n=== [{i}/{len(pdfs)}] {os.path.basename(pdf_path)} ===")
         initial: VisaState = {"pdf_path": pdf_path, "statement": None, "extractor": None, "error": None,
-                              "validation_passed": None, "status": "Started", "log": []}
+                              "validation_passed": None, "validation": None, "account_id": None,
+                              "statement_id": None, "recon": None, "status": "Started", "log": []}
         try:
             final = app.invoke(initial)
         except Exception as e:   # one bad file never stops the rest of the loop
             print(f"   ❌ unexpected error: {e}")
             final = {**initial, "status": "Error"}
-        stmt = final.get("statement")
-        results.append((os.path.basename(pdf_path), stmt.statement_date if stmt else None,
-                        len(stmt.transactions) if stmt else 0, final["status"]))
+        stmt, recon = final.get("statement"), final.get("recon")
+        results.append((stmt.statement_date if stmt else None, len(stmt.transactions) if stmt else 0,
+                        final["status"], recon, os.path.basename(pdf_path)))
 
     print("\nSummary:")
-    print(f"   {'Statement':12} {'Txns':>5}  {'Status':34} File")
-    for name, sdate, count, status in results:
-        print(f"   {str(sdate or '-'):12} {count:>5}  {status:34} {name}")
+    print(f"   {'Statement':11} {'Txns':>4}  {'Status':24} {'Matched':>7} {'CardOnly':>8} {'QBOnly':>6} {'Variance':>11}  File")
+    for sdate, count, status, recon, name in results:
+        r = recon or {}
+        var = f"{r['variance']:,.2f}" if recon else "-"
+        print(f"   {str(sdate or '-'):11} {count:>4}  {status:24} {r.get('matched', '-'):>7} "
+              f"{r.get('card_only', '-'):>8} {r.get('qb_only', '-'):>6} {var:>11}  {name}")
+    print("\nDetail: SELECT * FROM fin.vw_QBReconDetail WHERE StatementDate = '<date>' ORDER BY SortOrder, LineDate;")
 
 
 if __name__ == "__main__":

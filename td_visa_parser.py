@@ -47,8 +47,8 @@ TXN_LINE = re.compile(
     rf"(?:\s+TOTAL NEW BALANCE.*)?$"        # last line of a page can share a line with the total
 )
 TABLE_START = re.compile(r"^(PREVIOUS STATEMENT BALANCE|DATE DATE)")
-TABLE_END = re.compile(r"^(Continued|TOTAL NEW BALANCE|TD MESSAGE CENTRE)")
-FX_AMOUNT = re.compile(r"^FOREIGN CURRENCY\s+([\d,]+\.\d{2})\s+([A-Z]{3})$")
+TABLE_END = re.compile(r"^(Continued|TOTAL NEW BALANCE|TD MESSAGE CENTRE|NET AMOUNT OF MONTHLY)")   # the last: older statements' subtotal
+FX_AMOUNT = re.compile(r"^FOREIGN CURRENCY\s+([\d,]+\.\d{2})\s+([A-Z]{3})(?:\s+@\s*EXCHANGE RATE\s+([\d.]+))?$")
 FX_RATE = re.compile(r"^@\s*EXCHANGE RATE\s+([\d.]+)$")
 
 
@@ -67,11 +67,15 @@ def _summary_value(right_text: str, label: str) -> float:
     return _money(m.group(1))
 
 
+# TD words cash advances in English and French, e.g. "CASH ADV./AV. DE FONDS"
+CASH_ADVANCE_WORDS = re.compile(r"CASH ADV|AV\. DE FONDS|BALANCE TRANSFER|TRANSFERT DE SOLDE|VISA CHEQUE|CHEQUE VISA")
+
+
 def _classify(description: str, amount: float) -> TxnType:
     d = description.upper()
     if d.startswith(("RETAIL INTEREST", "CASH INTEREST")) or d.endswith(" INTEREST"):
         return TxnType.INTEREST
-    if "CASH ADVANCE" in d:
+    if amount > 0 and CASH_ADVANCE_WORDS.search(d):
         return TxnType.CASH_ADVANCE
     if amount < 0:
         return TxnType.PAYMENT if "PAYMENT" in d else TxnType.REFUND
@@ -157,6 +161,8 @@ def parse_td_visa(pdf_path: str) -> CardStatement:
                 if fx_amt:
                     last.foreign_amount = _money(fx_amt.group(1))
                     last.foreign_currency = fx_amt.group(2)
+                    if fx_amt.group(3):
+                        last.exchange_rate = float(fx_amt.group(3))
                 elif fx_rate:
                     last.exchange_rate = float(fx_rate.group(1))
                 elif re.search(AMOUNT, line):
@@ -166,6 +172,10 @@ def parse_td_visa(pdf_path: str) -> CardStatement:
 
     if not transactions:
         raise TDVisaParseError("no transactions found")
+
+    notes = []
+    for txn_type, printed in ((TxnType.CASH_ADVANCE, summary.cash_advances), (TxnType.FEE, summary.fees)):
+        notes += _match_printed_total(transactions, txn_type, printed)
 
     return CardStatement(
         source_file=os.path.basename(pdf_path),
@@ -177,4 +187,32 @@ def parse_td_visa(pdf_path: str) -> CardStatement:
         period_end=period_end,
         summary=summary,
         transactions=transactions,
+        notes=notes,
     )
+
+
+def _match_printed_total(transactions: list[Transaction], txn_type: TxnType, printed: float) -> list[str]:
+    """
+    TD sometimes counts a line as a cash advance (or fee) without saying so in its
+    description - e.g. "LONDON VISA CUSTOMER SERV" in the Jul 2025 statement. If the
+    lines of that type fall short of the printed total, look for the ONE combination
+    of up to 3 purchase lines that makes up the shortfall exactly and reclassify it.
+    If there's no unique answer, nothing changes and the validator flags the statement.
+    """
+    from itertools import combinations
+    cents = lambda x: int(round(x * 100))
+    shortfall = cents(printed) - cents(sum(t.amount for t in transactions if t.txn_type == txn_type))
+    if shortfall <= 0:
+        return []
+    purchases = [t for t in transactions if t.txn_type == TxnType.PURCHASE]
+    for size in (1, 2, 3):
+        hits = [c for c in combinations(purchases, size) if sum(cents(t.amount) for t in c) == shortfall]
+        if len(hits) == 1:
+            for t in hits[0]:
+                t.txn_type = txn_type
+            return [f"counted as {txn_type.value} to match TD's printed total ({printed:,.2f}): "
+                    + ", ".join(f"{t.posting_date} {t.description[:30]} {t.amount:,.2f}" for t in hits[0])]
+        if len(hits) > 1:
+            return [f"{txn_type.value} total is {shortfall / 100:,.2f} short and {len(hits)} different line "
+                    f"combinations fit - left for review"]
+    return []
