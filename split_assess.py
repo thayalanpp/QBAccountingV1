@@ -253,15 +253,23 @@ def qb_checks(m: SplitMonth, cycle: Optional[CardCycle], ev: Evidence, r: MonthR
     if not ev.qb_dntl:
         r.add("qb", "Warning", "Dental QuickBooks lines aren't loaded - postings not checked")
         return
-    if r.cheque_number:
-        entry = [q for q in ev.qb_dntl if ref_digits(q.ref_num) == r.cheque_number
-                 and abs((q.txn_date - r.cheque_date).days) <= 60]
-        entry_ids = {q.entry_id for q in entry if q.account_number == ev.dntl_bank_qb_account
-                     and _c(abs(q.amount)) == _c(m.cheque_total)} or {q.entry_id for q in entry}
+    if r.cheque_date:
+        if r.cheque_number:
+            entry = [q for q in ev.qb_dntl if ref_digits(q.ref_num) == r.cheque_number
+                     and abs((q.txn_date - r.cheque_date).days) <= 60]
+            entry_ids = {q.entry_id for q in entry if q.account_number == ev.dntl_bank_qb_account
+                         and _c(abs(q.amount)) == _c(m.cheque_total)} or {q.entry_id for q in entry}
+        else:
+            # No cheque number in the bank data (e.g. the FY2024 export): find the QB entry that takes
+            # the same amount out of the Dental bank account within a few days of the bank date.
+            entry_ids = {q.entry_id for q in ev.qb_dntl if q.account_number == ev.dntl_bank_qb_account
+                         and q.amount < 0 and abs(_c(-q.amount) - _c(m.cheque_total)) <= QB_ROUNDING_CENTS
+                         and abs((q.txn_date - r.cheque_date).days) <= 10}
+        label = f"cheque {r.cheque_number}" if r.cheque_number else f"the {r.cheque_date} split cheque"
         legs = [q for q in ev.qb_dntl if q.entry_id in entry_ids and q.account_number != ev.dntl_bank_qb_account]
         r.qb_cheque_found = bool(legs)
         if not legs:
-            r.add("qb", "Issue", f"cheque {r.cheque_number} ({m.cheque_total:,.2f}) not found in Dental QuickBooks",
+            r.add("qb", "Issue", f"{label} ({m.cheque_total:,.2f}) not found in Dental QuickBooks",
                   round(m.cheque_total, 2))
         else:
             unused = list(legs)
@@ -274,10 +282,10 @@ def qb_checks(m: SplitMonth, cycle: Optional[CardCycle], ev: Evidence, r: MonthR
                     unused.remove(hit)
                     r.qb_postings[l.category] = (hit.account_label, round(abs(hit.amount), 2))
                 else:
-                    r.add("qb", "Warning", f"cheque {r.cheque_number}: no QB line of {l.dpc_portion:,.2f} for the "
+                    r.add("qb", "Warning", f"{label}: no QB line of {l.dpc_portion:,.2f} for the "
                           f"{l.label.strip()} portion", round(l.dpc_portion, 2))
             if unused:
-                r.add("qb", "Info", f"cheque {r.cheque_number}: other QB lines " + ", ".join(
+                r.add("qb", "Info", f"{label}: other QB lines " + ", ".join(
                     f"{q.account_label} {abs(q.amount):,.2f}" for q in unused))
     if cycle and _c(m.visa_hygiene):
         gj = [q for q in ev.qb_dntl if q.account_number == ev.card_qb_account and "journal" in (q.txn_type or "").lower()

@@ -496,6 +496,7 @@ def _resolve_chart_account_id(engine, company_id, account_label, cache):
 class LoadPlan:
     period: FiscalPeriod
     sections_ok: list = field(default_factory=list)       # [(Section, [TxnLine in period])]
+    balances: dict = field(default_factory=dict)          # id(Section) -> (opening at FY start, closing at FY end)
     failures: list = field(default_factory=list)          # validation failures (dicts)
     rows_in_period: int = 0
     rows_outside_period: int = 0
@@ -518,8 +519,11 @@ def build_plan(sections: list[Section], period: FiscalPeriod) -> LoadPlan:
             continue
 
         in_period = []
+        running, fy_open, fy_close = result.opening_balance, None, None
         for r in section.rows:
             d = _to_date(r.txn_date)
+            if d is not None and d < period.start:
+                running = round(running + r.amount, 2)
             if d is None:
                 plan.rows_bad_date += 1
             elif period.start <= d <= period.end:
@@ -527,9 +531,12 @@ def build_plan(sections: list[Section], period: FiscalPeriod) -> LoadPlan:
                 in_period.append(r)
             else:
                 plan.rows_outside_period += 1
+        fy_open = running                                     # balance just before the year starts
+        fy_close = round(fy_open + sum(r.amount for r in in_period), 2)
         plan.rows_in_period += len(in_period)
         if in_period:
             plan.sections_ok.append((section, in_period))
+            plan.balances[id(section)] = (fy_open, fy_close)
     return plan
 
 
@@ -565,9 +572,12 @@ def _log_run(conn, company_id, period, source_file, status, report):
 # Orchestrator
 # =====================================================================
 
+SHRINK_LIMIT = 0.9     # refuse a reload that writes < 90% of the lines the year already has
+
+
 def load_company(engine, company_code, account_list_path, transaction_detail_path,
                  fy_end_year, legal_name=None, source_file_label=None,
-                 allow_partial=False, dry_run=False):
+                 allow_partial=False, dry_run=False, allow_shrink=False):
     """
     Replace one company's ledger for one fiscal year with the contents
     of the given exports.
@@ -610,6 +620,16 @@ def load_company(engine, company_code, account_list_path, transaction_detail_pat
     elif plan.rows_in_period == 0:
         abort_reason = (f"no transactions in the export fall inside {period} - "
                         f"wrong file or wrong --fy-end?")
+
+    # Guard: a reload that would leave the year with far fewer lines than it has now is almost
+    # always a wrong or filtered export (e.g. only some accounts) - refuse unless confirmed.
+    if abort_reason is None and company_id is not None and not allow_shrink:
+        with engine.connect() as conn:
+            _, existing_lines = _count_existing(conn, company_id, period)
+        if existing_lines and plan.rows_in_period < SHRINK_LIMIT * existing_lines:
+            abort_reason = (f"the export has {plan.rows_in_period:,} lines for this year but SQL already holds "
+                            f"{existing_lines:,} - is it filtered or the wrong file? Nothing changed. "
+                            f"Rerun with --allow-shrink only if the smaller file is really right.")
 
     if dry_run:
         if company_id is not None:
@@ -686,6 +706,17 @@ def load_company(engine, company_code, account_list_path, transaction_detail_pat
         report["status"] = status
         if plan.failures:
             report["notes"] = ("Skipped: " + "; ".join(f["account"] for f in plan.failures))[:400]
+        # Opening / closing balance of every account with activity this year, as QuickBooks' own
+        # running balance (the export's Balance column) - replaced with the year.
+        conn.execute(text("DELETE FROM qb.AccountBalances WHERE CompanyID = :cid AND FiscalYearEnd = :fy"),
+                     {"cid": company_id, "fy": period.fy_end_year})
+        bal_rows = [{"cid": company_id, "acct": account_ids[id(sec)], "fy": period.fy_end_year,
+                     "o": plan.balances[id(sec)][0], "c": plan.balances[id(sec)][1], "src": source_file}
+                    for sec, _ in plan.sections_ok if id(sec) in plan.balances]
+        if bal_rows:
+            conn.execute(text("""INSERT INTO qb.AccountBalances
+                                     (CompanyID, ChartAccountID, FiscalYearEnd, OpeningBalance, ClosingBalance, SourceFile)
+                                 VALUES (:cid, :acct, :fy, :o, :c, :src)"""), bal_rows)
         _log_run(conn, company_id, period, source_file, status, report)
 
     print(f"✅ {company_code}: replaced FY{period.fy_end_year} - removed {report['entries_deleted']:,} entries / "

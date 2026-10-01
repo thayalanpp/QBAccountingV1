@@ -787,3 +787,90 @@ BEGIN
     );
 END
 GO
+
+-- ------------------------------------------------------------
+-- qb.AccountBalances: each account's balance at the start and end of a
+-- fiscal year, from QuickBooks' own running balance in the Transaction
+-- Detail export (same sign as the export: debit +, credit -).
+-- Written by run_qb_load.py, replaced with the year. Used for roll-forwards
+-- (e.g. 22200 credit card vs the real card balance).
+-- ------------------------------------------------------------
+IF OBJECT_ID('qb.AccountBalances', 'U') IS NULL
+BEGIN
+    CREATE TABLE qb.AccountBalances (
+        CompanyID       INT            NOT NULL,
+        ChartAccountID  INT            NOT NULL,
+        FiscalYearEnd   SMALLINT       NOT NULL,
+        OpeningBalance  DECIMAL(14,2)  NOT NULL,   -- just before the year's first day
+        ClosingBalance  DECIMAL(14,2)  NOT NULL,   -- at the year's last day
+        SourceFile      NVARCHAR(400)  NULL,
+        LoadedAt        DATETIME2      NOT NULL CONSTRAINT DF_AccountBalances_LoadedAt DEFAULT (SYSUTCDATETIME()),
+        CONSTRAINT PK_AccountBalances PRIMARY KEY (CompanyID, ChartAccountID, FiscalYearEnd),
+        CONSTRAINT FK_AccountBalances_Companies FOREIGN KEY (CompanyID) REFERENCES qb.Companies(CompanyID),
+        CONSTRAINT FK_AccountBalances_COA FOREIGN KEY (ChartAccountID) REFERENCES qb.ChartOfAccounts(ChartAccountID)
+    );
+END
+GO
+
+-- ============================================================
+-- Agent message board (board_seed.py / board_export.py)
+--   agent.Agents    who posts: build_agent, dental_agent, hygiene_agent, owner ...
+--   agent.Messages  the board: decisions, facts, findings, proposals, questions, tasks
+-- The pipelines keep writing machine findings to fin.Findings; agents post their
+-- interpretation here and reference the evidence (a query, a file, a FindingID).
+-- ============================================================
+IF SCHEMA_ID('agent') IS NULL
+    EXEC('CREATE SCHEMA agent');
+GO
+
+IF OBJECT_ID('agent.Agents', 'U') IS NULL
+BEGIN
+    CREATE TABLE agent.Agents (
+        AgentKey          NVARCHAR(40)   NOT NULL,
+        Persona           NVARCHAR(200)  NOT NULL,
+        Responsibilities  NVARCHAR(2000) NULL,
+        CONSTRAINT PK_Agents PRIMARY KEY (AgentKey)
+    );
+END
+GO
+
+IF OBJECT_ID('agent.Messages', 'U') IS NULL
+BEGIN
+    CREATE TABLE agent.Messages (
+        MessageID     INT IDENTITY(1,1) NOT NULL,
+        SeedKey       NVARCHAR(100)  NULL,       -- stable key for seeded posts, so reseeding updates instead of duplicating
+        ThreadKey     NVARCHAR(100)  NOT NULL,   -- e.g. 'dntl-22200', 'build-backlog'
+        ParentID      INT            NULL,
+        Author        NVARCHAR(40)   NOT NULL,   -- agent.Agents.AgentKey
+        Audience      NVARCHAR(40)   NOT NULL CONSTRAINT DF_Messages_Audience DEFAULT ('all'),
+        MsgType       NVARCHAR(20)   NOT NULL,   -- Decision | Fact | Finding | Proposal | Question | Answer | Task | Status
+        Area          NVARCHAR(30)   NULL,       -- visa | bank | qb | split | rollforward | coa | cleanup | build
+        Company       NVARCHAR(20)   NULL,       -- dntl | hyg | mgmt
+        FiscalYear    SMALLINT       NULL,
+        Title         NVARCHAR(200)  NOT NULL,
+        Body          NVARCHAR(MAX)  NOT NULL,   -- markdown
+        Amount        DECIMAL(14,2)  NULL,
+        Evidence      NVARCHAR(1000) NULL,       -- query, file, FindingID ...
+        Status        NVARCHAR(20)   NOT NULL CONSTRAINT DF_Messages_Status DEFAULT ('Open'),   -- Open | Resolved | Superseded
+        Priority      TINYINT        NOT NULL CONSTRAINT DF_Messages_Priority DEFAULT (2),     -- 1 high .. 3 low
+        SupersedesID  INT            NULL,
+        CreatedAt     DATETIME2      NOT NULL CONSTRAINT DF_Messages_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        UpdatedAt     DATETIME2      NULL,
+        CONSTRAINT PK_Messages PRIMARY KEY (MessageID),
+        CONSTRAINT FK_Messages_Author FOREIGN KEY (Author) REFERENCES agent.Agents(AgentKey)
+    );
+    CREATE UNIQUE INDEX UX_Messages_SeedKey ON agent.Messages(SeedKey) WHERE SeedKey IS NOT NULL;
+    CREATE INDEX IX_Messages_Thread ON agent.Messages(ThreadKey, MessageID);
+END
+GO
+
+-- Open items for an agent (or everyone): what still needs doing or deciding.
+IF OBJECT_ID('agent.vw_OpenItems', 'V') IS NOT NULL
+    DROP VIEW agent.vw_OpenItems;
+GO
+
+CREATE VIEW agent.vw_OpenItems AS
+SELECT MessageID, ThreadKey, Author, Audience, MsgType, Area, Company, FiscalYear, Title, Amount, Priority, CreatedAt
+FROM agent.Messages
+WHERE Status = 'Open' AND MsgType IN ('Task', 'Question', 'Proposal');
+GO

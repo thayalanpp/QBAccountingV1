@@ -5,7 +5,7 @@
    @FullReset = 0 (default) - TRANSACTION DATA ONLY
        Clears:  fin.Findings, fin.Split* (monthly split), fin.QBReconItems, fin.QBRecon, fin.TransactionSplits,
                 fin.Transactions, fin.Reconciliation, fin.Statements,
-                qb.JournalEntryLines, qb.JournalEntries, qb.LoadRuns
+                qb.JournalEntryLines, qb.JournalEntries, qb.AccountBalances, qb.LoadRuns
        Keeps:   fin.Accounts, fin.AccountLink, qb.Companies, qb.AccountMap, qb.StdAccounts,
                 qb.ChartOfAccounts, qb.Classes
        Use this between normal test runs - the loaders refill everything.
@@ -46,6 +46,7 @@ FROM (
     SELECT 'fin.Accounts',                       COUNT_BIG(*)           FROM fin.Accounts          UNION ALL
     SELECT 'qb.JournalEntryLines',               COUNT_BIG(*)           FROM qb.JournalEntryLines  UNION ALL
     SELECT 'qb.JournalEntries',                  COUNT_BIG(*)           FROM qb.JournalEntries     UNION ALL
+    SELECT 'qb.AccountBalances',                 COUNT_BIG(*)           FROM qb.AccountBalances    UNION ALL
     SELECT 'qb.LoadRuns',                        COUNT_BIG(*)           FROM qb.LoadRuns           UNION ALL
     SELECT 'qb.Classes',                         COUNT_BIG(*)           FROM qb.Classes            UNION ALL
     SELECT 'qb.ChartOfAccounts',                 COUNT_BIG(*)           FROM qb.ChartOfAccounts    UNION ALL
@@ -71,6 +72,7 @@ BEGIN TRY
 
     DELETE FROM qb.JournalEntryLines;
     DELETE FROM qb.JournalEntries;
+    DELETE FROM qb.AccountBalances;
     DELETE FROM qb.LoadRuns;
 
     -- ---------- Setup data (only on a full reset) ----------
@@ -134,6 +136,7 @@ FROM (
     SELECT 'fin.Accounts',                       COUNT_BIG(*)           FROM fin.Accounts          UNION ALL
     SELECT 'qb.JournalEntryLines',               COUNT_BIG(*)           FROM qb.JournalEntryLines  UNION ALL
     SELECT 'qb.JournalEntries',                  COUNT_BIG(*)           FROM qb.JournalEntries     UNION ALL
+    SELECT 'qb.AccountBalances',                 COUNT_BIG(*)           FROM qb.AccountBalances    UNION ALL
     SELECT 'qb.LoadRuns',                        COUNT_BIG(*)           FROM qb.LoadRuns           UNION ALL
     SELECT 'qb.Classes',                         COUNT_BIG(*)           FROM qb.Classes            UNION ALL
     SELECT 'qb.ChartOfAccounts',                 COUNT_BIG(*)           FROM qb.ChartOfAccounts    UNION ALL

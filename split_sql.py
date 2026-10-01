@@ -33,6 +33,7 @@ class CardCycle:
     opening: float
     ending: float
     lines: list[CardLine] = field(default_factory=list)
+    period_start: Optional[date] = None
 
     @property
     def payments(self) -> list[CardLine]:
@@ -74,17 +75,17 @@ def load_card_cycles(engine, card_account_name: str) -> list[CardCycle]:
         aid = _account_id(conn, card_account_name, "Visa")
         if aid is None:
             return []
-        stmts = conn.execute(text("""SELECT StatementID, StatementDate, OpeningBalance, EndingBalance
+        stmts = conn.execute(text("""SELECT StatementID, StatementDate, OpeningBalance, EndingBalance, PeriodStart
                                      FROM fin.Statements WHERE AccountID = :a ORDER BY StatementDate"""),
                              {"a": aid}).fetchall()
         cycles = []
-        for sid, sdate, opening, ending in stmts:
+        for sid, sdate, opening, ending, pstart in stmts:
             rows = conn.execute(text("""SELECT TransactionID, TransactionDate, PostingDate, Description, Amount, TxnType
                                         FROM fin.Transactions WHERE StatementID = :s ORDER BY LineNumber, TransactionID"""),
                                 {"s": sid}).fetchall()
             cycles.append(CardCycle(sid, _as_date(sdate), float(opening), float(ending),
                                     [CardLine(r[0], _as_date(r[1]), _as_date(r[2] or r[1]), r[3], float(r[4]), r[5])
-                                     for r in rows]))
+                                     for r in rows], _as_date(pstart)))
     return cycles
 
 
@@ -127,6 +128,32 @@ def load_qb_lines(engine, company_code: str, date_from: date, date_to: date) -> 
         label = r[5] if str(r[5]).startswith(str(r[4])) else f"{r[4]} · {r[5]}"
         out.append(QBLine(r[0], _as_date(r[1]), r[2], r[3], str(r[4]), label, float(r[6]), r[7], r[8]))
     return out
+
+
+def load_account_balance(engine, company_code: str, account_number: str, fy_end: int) -> Optional[tuple]:
+    """(opening, closing) of a QB account for a fiscal year, as QuickBooks' running balance - or None."""
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT b.OpeningBalance, b.ClosingBalance
+            FROM qb.AccountBalances b
+            JOIN qb.Companies c        ON c.CompanyID = b.CompanyID
+            JOIN qb.ChartOfAccounts a  ON a.ChartAccountID = b.ChartAccountID
+            WHERE c.CompanyCode = :co AND a.AccountNumber = :n AND b.FiscalYearEnd = :fy"""),
+            {"co": company_code, "n": account_number, "fy": fy_end}).fetchone()
+    return (float(row[0]), float(row[1])) if row else None
+
+
+def load_card_matches(engine, card_account_name: str) -> dict:
+    """Card TransactionID -> matched QB LineID, from the Visa pipeline's reconciliation."""
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT ri.TransactionID, ri.QBLineID
+            FROM fin.QBReconItems ri
+            JOIN fin.Statements s ON s.StatementID = ri.StatementID
+            JOIN fin.Accounts a   ON a.AccountID = s.AccountID
+            WHERE ri.MatchStatus = 'Matched' AND a.AccountName = :n AND a.AccountType = 'Visa'"""),
+            {"n": card_account_name}).fetchall()
+    return {int(r[0]): int(r[1]) for r in rows if r[0] is not None and r[1] is not None}
 
 
 def ref_digits(ref) -> Optional[str]:
