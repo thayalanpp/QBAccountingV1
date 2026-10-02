@@ -35,7 +35,7 @@ post("own-entities", "context", "owner", "Fact", None, None, None, "Entities, ac
 - **HYG** DHM Dental Hygiene Technical Services Corporation - Scotiabank 26492-00688-10 (QB 1010 and sub-account 1010.25 "Post smitha" = the new start in 2021).
 - **MGMT** Dental & Hygiene Management - TD 0561-5208812 (QB 1010).
 - The TD Visa is Dental's card but is **paid from Hygiene's bank**; Dental reimburses Hygiene with a monthly "split" cheque. Management receives $2,500 cheques from Dental.
-- SQL Server: NilashaAI, database QBAccounting. Repo: github.com/thayalanpp/QBAccountingV1 (tag v0.2-baseline).
+- SQL Server: NilashaAI, database QBAccounting. Repo: github.com/thayalanpp/QBAccountingV1 (tag v0.3-baseline).
 """, status="Resolved")
 post("own-dec-workbook", "decisions", "owner", "Decision", "split", None, None, "Split workbook is read as is", """
 NM_<year>.xlsx (one sheet per month, rows 2-8: salary, rent, lease, bookkeeping, visa; B = total, C = Dental's (DPC) portion, C8 = the split cheque, D6 = lab fees on the card at 100%) is read **as is**. The years are closed; differences become proposed adjustments, never edits to the workbook.
@@ -67,22 +67,24 @@ All rule-based Python + SQL Server; LangGraph orchestrates each pipeline; nothin
 | TD Visa | visa_pipeline.py, td_visa_parser.py, statement_validator.py, visa_sql.py, qb_matcher.py | Parses statement PDFs, 10 checks (summary math, totals by type, chaining...), saves, matches to QB 22200 |
 | Banks | bank_pipeline.py, bank_readers.py, bank_validator.py, bank_sql.py, bank_models.py | Scotiabank/TD exports (Excel/CSV), statement PDFs as known balances, monthly periods, matches to QB bank accounts, fin.vw_AccountTransfers |
 | Split | split_pipeline.py, split_reader.py, split_assess.py, split_sql.py, rollforward.py | Reads NM_<year>.xlsx, links cheques/deposits/card, cash & expense tests, QB postings, boundary months, 22200 roll-forward, cut-off; writes split_review_FY<year>.xlsx |
+| GL balances | load_gl_balances.py | Reads the multi-year GL (dntl: C:\\NM\\quickbooks\\dntl\\qb sv gl 2020-2026.xlsx); balance-sheet accounts' balance at every Aug 31, export sign (debit +); refuses to save unless every section re-derives, the known balances agree and each year's movement equals the one-year load; upserts qb.AccountBalances |
 | Chart of accounts | load_account_map.py | Loads the reviewed group chart mapping (qb.StdAccounts / qb.AccountMap) |
 sql/schema.sql is applied automatically at the start of every pipeline. sql/reset_test_data.sql clears loaded data.
 """, status="Resolved")
 post("bld-run-order", "build-architecture", "build_agent", "Fact", "build", None, None, "Run order for a year", """
 ```
 python run_qb_load.py   --fy-end <Y> --only dntl      (and --only hyg)
+python load_gl_balances.py --company dntl [--last-fy <Y>]
 python visa_pipeline.py --fy-end <Y>
 python bank_pipeline.py --fy-end <Y> --only dntl,hyg
 python split_pipeline.py --fy-end <Y>
 ```
-Reloading QuickBooks gives its lines new IDs - **always rerun visa and bank after a QB reload**. Every pipeline replaces its own year (never duplicates); a failed validation saves nothing.
+Reloading QuickBooks gives its lines new IDs - **always rerun visa and bank after a QB reload**. A QB reload also rewrites that year's qb.AccountBalances with a 0 opening - **always rerun load_gl_balances.py after it**. Every pipeline replaces its own year (never duplicates); a failed validation saves nothing.
 """, status="Resolved")
 post("bld-qb-quirks", "build-quirks", "build_agent", "Fact", "qb", None, None, "QuickBooks export quirks", """
 - Multi-year exports drop income/expense except the final year -> export one FY per file.
-- The one-year Transaction Detail report starts 22200's running balance at **0** (no balance brought forward) -> qb.AccountBalances opening is wrong for balance-sheet accounts; the multi-year GL has the true balances.
-- DNTL QuickBooks is booked only up to **Sep 29, 2025** (FY2026 not yet).
+- The one-year Transaction Detail report starts 22200's running balance at **0** (no balance brought forward) -> run_qb_load.py stores a 0 opening for balance-sheet accounts; load_gl_balances.py replaces it with the multi-year GL's balances (rerun after every QB reload).
+- DNTL QuickBooks was booked only up to **Sep 29, 2025**; the multi-year GL exported Oct 2026 has rows dated up to **Aug 31, 2026** - confirm whether FY2026 is fully booked before using its balances.
 - qb_loader refuses a reload writing < 90% of the lines the year already holds (shrink guard). run_qb_load.py has a custom COMPANIES block - don't overwrite it.
 """, status="Resolved")
 post("bld-bank-quirks", "build-quirks", "build_agent", "Fact", "bank", None, None, "Bank data quirks", """
@@ -108,13 +110,21 @@ post("bld-status-data", "state", "build_agent", "Status", "build", None, None, "
 | Bank DNTL | 943 lines, all 12 statements agree, 943/943 match QB | 1,013 lines, all statements agree, 1,013/1,013 match QB |
 | Bank HYG | 326 lines, all statements agree, 246/326 match QB | 330 lines, all statements agree, 326/330 match QB |
 | TD Visa | statements Aug 2023 - Sep 2025 (26), all valid | |
-| Split review | run (12/12 OK) | run |
+| GL balances DNTL | from the multi-year GL - all checkpoints and movements agree | same |
+| Split review | run (12/12 OK); 22200 roll-forward 15,772.83 -> 15,896.51, unexplained 0.00 | run; 22200 roll-forward 15,896.51 -> 35,669.96, unexplained 0.00 |
 Not loaded: FY2021-2023, FY2026, Management.
 """)
 post("bld-task-gl-balances", "build-backlog", "build_agent", "Task", "rollforward", "dntl", 2025,
      "Take opening balances from the multi-year GL", """
 qb.AccountBalances opening for balance-sheet accounts is 0 (see QuickBooks quirks). Build load_gl_balances.py: read the multi-year GL (C:\\NM\\quickbooks\\dntl\\qb sv gl 2020-2026.xlsx), compute each balance-sheet account's balance at every FY end, store in qb.AccountBalances. The 22200 roll-forward will then start from **12,466.03 Dr** at Aug 31 2024.
-""", priority=1)
+
+**Done (Oct 2026).** load_gl_balances.py built and run for DNTL. Dry run: every section re-derives; 10000, 22200, 22100, 22150 agree with the known Aug 31 2023/2024/2025 balances to the cent; movements agree with the FY2024/FY2025 one-year loads. Split review rerun:
+| | Opening gap | Closing gap | Unexplained |
+|---|---|---|---|
+| FY2024 | 15,772.83 (QB owed -9,502.48 vs card 6,270.35) | 15,896.51 | 0.00 |
+| FY2025 | 15,896.51 (QB owed -12,466.03 vs card 3,430.48) | 35,669.96 (-35,260.97 vs 408.99) | 0.00 |
+FY2025 items agree with dental_agent's itemization (-15,510.10 / -4,350.15 / +174.10 / -87.30). Items 4, 7, 8 are still gross until the washes-out grouping (next roll-forward task).
+""", status="Resolved", priority=1)
 post("bld-task-rf-lines", "build-backlog", "build_agent", "Task", "rollforward", "dntl", None,
      "Roll-forward: timing line, washes-out group, year-end accrual", """
 1. Separate line for the previous year's August split cheque paid in September (e.g. cheque 23, visa portion 3,991.57).
@@ -152,7 +162,7 @@ post("dnt-22200-gap", "dntl-22200", "dental_agent", "Finding", "rollforward", "d
 | Owed per TD statements | 6,270.35 | 3,430.48 | 408.99 |
 | QB understates the card by | 15,772.83 | 15,896.51 | 35,669.96 |
 FY2024 moved the gap only **+123.68** (wrong-sign entries). FY2025 added **19,773.45**. The 15,772.83 predates FY2024 (FY2021-2023, unexplained until those years are loaded).
-""", amount=35669.96, evidence="split_review_FY2025.xlsx sheet 22200 roll-forward (opening needs the GL fix)", priority=1)
+""", amount=35669.96, evidence="split_review_FY2025.xlsx sheet 22200 roll-forward (opens from the GL balance; unexplained 0.00)", priority=1)
 post("dnt-fy2024-split", "dntl-split", "dental_agent", "Finding", "split", "dntl", 2024, "FY2024 split: clean", """
 12/12 months: B6 = what Hygiene paid TD = the cycle's own charges. No carried balances. Only item: the Sep 2023 cheque was 13,028.47 vs C8 13,023.47 (**$5.00** over).
 """, amount=5.00, status="Resolved")
