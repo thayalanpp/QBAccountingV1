@@ -12,7 +12,7 @@ One sheet per month ("Sep 2024", "July 2025", ...). Only the split block is used
     3     rent           3,225.38             B*0.6
     4     lease          125.43 / 352.54      B*0.6 or B*0.8
     5     bookkeping     250                  B*0.5
-    6     visa           visa payment due     (B6-D6)*0.8 + D6               D6 = lab fees on the card
+    6     visa/expense   visa payment due     (B6-D6)*0.8 + D6               D6 = lab fees on the card
     8                    SUM(B2:B6)           C8 = SUM(C2:C6) - D8  = the DNTL split cheque
 
     Lab fees on the card: descriptions in column K, amounts in column M (rows 1-7), M8 = total.
@@ -35,11 +35,21 @@ VISA_DPC_RATE = 0.8                  # non-lab card charges; lab fees are 100% D
 
 def _category(label: str) -> str:
     t = re.sub(r"[^a-z]", "", str(label or "").lower())
+    if "visa" in t:                                   # "Visa", "visa payment", "VISA due" ...
+        return "visa"
     return {"bookkeping": "bookkeeping"}.get(t, t)
 
 
 def _num(v) -> float:
-    return float(v) if isinstance(v, (int, float)) else 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):                            # a number typed as text, e.g. "10,076.74" or "$1,234.50"
+        t = v.strip().replace(",", "").replace("$", "")
+        try:
+            return float(t)
+        except ValueError:
+            return 0.0
+    return 0.0
 
 
 @dataclass
@@ -117,10 +127,17 @@ def read_split_workbook(path: str) -> list[SplitMonth]:
             if not label:
                 continue
             b, c = ws.cell(r, 2).value, ws.cell(r, 3).value
-            if isinstance(wf.cell(r, 3).value, str) and c is None:
-                notes.append(f"row {r}: column C has a formula but no saved value - open and save the file in Excel")
+            for col, v in ((2, b), (3, c)):
+                if isinstance(wf.cell(r, col).value, str) and wf.cell(r, col).value.startswith("=") and v is None:
+                    notes.append(f"row {r}: column {'BC'[col - 2]} has a formula ({wf.cell(r, col).value}) but no saved "
+                                 f"value - open and save the file in Excel")
+            if isinstance(b, str):
+                notes.append(f"row {r}: column B is text ({b!r}), read as {_num(b):,.2f}")
             f = wf.cell(r, 3).value
-            lines.append(SplitLine(_category(label), str(label).strip(), round(_num(b), 2), _num(c),
+            cat = _category(label)
+            if r == 6 and cat not in ("salary", "rent", "lease", "bookkeeping"):
+                cat = "visa"                          # row 6 is the card line whatever it's called ("visa", "expense", ...)
+            lines.append(SplitLine(cat, str(label).strip(), round(_num(b), 2), _num(c),
                                    f if isinstance(f, str) else None))
         lab_items = []
         for r in range(1, 8):

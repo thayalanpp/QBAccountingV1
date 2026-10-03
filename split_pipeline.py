@@ -17,6 +17,7 @@ split_pipeline.py  -  checks the monthly Dental / Hygiene split workbook
 Run it after the other pipelines have loaded the year:
     python split_pipeline.py
     python split_pipeline.py --workbook "C:\\NM\\2025yearend\\NM_2025.xlsx"
+    python split_pipeline.py --fy-end 2026 --no-qb      (year still being booked in QuickBooks)
 
 Nothing in QuickBooks or the workbook is changed.
 """
@@ -56,6 +57,7 @@ CARD_QB_ACCOUNT = "22200"
 VISA_PAYMENT_PATTERN = "td visa"                  # Hygiene's payments to TD look like "Pc-Td Visa 38099194"
 
 ENGINE = None
+NO_QB = False          # --no-qb: year still being booked - check card, bank and split only
 
 
 class SplitState(TypedDict):
@@ -118,14 +120,16 @@ def load_evidence(state: SplitState) -> dict:
                   dntl_bank=split_sql.load_bank_lines(ENGINE, DNTL_BANK),
                   hyg_bank=split_sql.load_bank_lines(ENGINE, HYG_BANK),
                   all_withdrawals=split_sql.load_all_bank_withdrawals(ENGINE),
-                  qb_dntl=split_sql.load_qb_lines(ENGINE, QB_COMPANY, fy.start - timedelta(days=60),
-                                                  fy.end + timedelta(days=90)),
+                  qb_dntl=[] if NO_QB else split_sql.load_qb_lines(ENGINE, QB_COMPANY, fy.start - timedelta(days=60),
+                                                                   fy.end + timedelta(days=90)),
                   dntl_bank_qb_account=DNTL_BANK_QB_ACCOUNT, card_qb_account=CARD_QB_ACCOUNT,
                   visa_payment_pattern=VISA_PAYMENT_PATTERN)
     print(f"🔎 load_evidence: {len(ev.cycles)} card statements, {len(ev.dntl_bank)} Dental bank lines, "
           f"{len(ev.hyg_bank)} Hygiene bank lines, {len(ev.qb_dntl)} Dental QB lines")
+    if NO_QB:
+        print("   --no-qb: QuickBooks not used (cheque postings and the 22200 roll-forward are skipped)")
     missing = [n for n, v in [("card statements", ev.cycles), ("Dental bank", ev.dntl_bank),
-                              ("Hygiene bank", ev.hyg_bank), ("Dental QuickBooks", ev.qb_dntl)] if not v]
+                              ("Hygiene bank", ev.hyg_bank)] + ([] if NO_QB else [("Dental QuickBooks", ev.qb_dntl)]) if not v]
     if missing:
         print(f"   ⚠️ not loaded yet: {', '.join(missing)} - those checks will be skipped")
     if not ev.hyg_bank:
@@ -171,6 +175,13 @@ def assess(state: SplitState) -> dict:
 def rollforward(state: SplitState) -> dict:
     """22200 against the real card balance at both year-ends, and the year-end cut-off."""
     fy, ev = state["fy"], state["evidence"]
+    cutoffs = rfmod.build_cutoffs(ev.cycles, fy.start, fy.end,
+                                  rfmod.lab_keywords(state["months"] + state["boundary"]))
+    if NO_QB:
+        print("📒 rollforward 22200: skipped (--no-qb)")
+        for co in cutoffs:
+            print(f"✂️  cut-off {co.label}: charges {co.charges:,.2f}, lab {co.lab:,.2f} -> Hygiene share {co.hygiene_share:,.2f}")
+        return {"rollforward": None, "cutoffs": cutoffs, "findings": list(state["findings"])}
     qb_22200 = [q for q in ev.qb_dntl if q.account_number == CARD_QB_ACCOUNT]
     balances = split_sql.load_account_balance(ENGINE, QB_COMPANY, CARD_QB_ACCOUNT, fy.fy_end_year)
     matches = split_sql.load_card_matches(ENGINE, CARD_ACCOUNT)
@@ -447,12 +458,14 @@ def build_graph():
 
 
 def main():
-    global ENGINE
+    global ENGINE, NO_QB
     ap = argparse.ArgumentParser(description="Check the monthly Dental / Hygiene split workbook against the bank, card and QB data.")
     ap.add_argument("--fy-end", type=int, default=FISCAL_YEAR_END)
     ap.add_argument("--workbook", help="Path to the split workbook (default: <year root>\\NM_<year>.xlsx)")
     ap.add_argument("--report", help="Where to write the review workbook")
     ap.add_argument("--root", help="Override the year folder")
+    ap.add_argument("--no-qb", action="store_true",
+                    help="Year still being booked in QuickBooks: check card, bank and split only")
     ap.add_argument("--show-graph", action="store_true")
     args = ap.parse_args()
     app = build_graph()
@@ -464,6 +477,7 @@ def main():
     report = args.report or os.path.join(root, REPORT.format(year=args.fy_end))
     if not os.path.exists(workbook):
         sys.exit(f"❌ Split workbook not found: {workbook}")
+    NO_QB = args.no_qb
     ENGINE = get_engine()
     ensure_schema(ENGINE)
     fy = fiscal_period(args.fy_end)
