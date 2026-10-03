@@ -1,4 +1,4 @@
-# QBAccountingV1 - handoff (2026-10-02)
+# QBAccountingV1 - handoff (2026-10-03)
 
 Paste this at the start of a new chat. It is the project's message board: decisions, facts, findings, proposals, open tasks and questions, posted by the agents below. Full detail lives in SQL (agent.Messages, fin.Findings) and in the review workbooks.
 
