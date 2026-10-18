@@ -1048,3 +1048,155 @@ OUTER APPLY (
     ORDER BY s.StatementDate
 ) card;
 GO
+
+-- ============================================================
+-- Accountant's year-end files (load_yearend.py)
+--   fin.YearEndAJE   M&Co's adjusting journal entries, one row per line (Debit / Credit both positive)
+--   fin.YearEndTB    M&Co's closing trial balance: Prelim + Adj + Reclass = Final (debit +, credit -)
+-- Loaded from CSVs prepared from the accountant's PDFs; one company x fiscal year is replaced per run.
+-- These entries are NOT in QuickBooks - comparing them with qb.* is the point.
+-- Company is the company code ('dntl', 'hyg'), joined to qb.Companies.CompanyCode.
+-- ============================================================
+IF OBJECT_ID('fin.YearEndAJE', 'U') IS NULL
+BEGIN
+    CREATE TABLE fin.YearEndAJE (
+        AJEID         INT IDENTITY(1,1) NOT NULL,
+        Company       VARCHAR(10)    NOT NULL,
+        FiscalYearEnd INT            NOT NULL,
+        AJENumber     INT            NOT NULL,
+        EntryDate     DATE           NOT NULL,
+        AccountNo     VARCHAR(20)    NOT NULL,
+        AccountName   NVARCHAR(100)  NULL,
+        Debit         DECIMAL(12,2)  NOT NULL CONSTRAINT DF_YEAJE_Debit DEFAULT (0),
+        Credit        DECIMAL(12,2)  NOT NULL CONSTRAINT DF_YEAJE_Credit DEFAULT (0),
+        Description   NVARCHAR(500)  NULL,
+        IsRollForward BIT            NOT NULL CONSTRAINT DF_YEAJE_RF DEFAULT (0),   -- "to record last year adjustment"
+        SourceDoc     NVARCHAR(200)  NULL,
+        LoadedAt      DATETIME2      NOT NULL CONSTRAINT DF_YEAJE_LoadedAt DEFAULT (SYSDATETIME()),
+        CONSTRAINT PK_YearEndAJE PRIMARY KEY (AJEID),
+        CONSTRAINT CK_YEAJE_Amounts CHECK (Debit >= 0 AND Credit >= 0)
+    );
+    CREATE INDEX IX_YearEndAJE_CoFY ON fin.YearEndAJE(Company, FiscalYearEnd, AccountNo);
+END
+GO
+
+IF OBJECT_ID('fin.YearEndTB', 'U') IS NULL
+BEGIN
+    CREATE TABLE fin.YearEndTB (
+        TBID           INT IDENTITY(1,1) NOT NULL,
+        Company        VARCHAR(10)    NOT NULL,
+        FiscalYearEnd  INT            NOT NULL,
+        AccountNo      VARCHAR(20)    NOT NULL,
+        AccountName    NVARCHAR(100)  NULL,
+        FSLine         NVARCHAR(100)  NULL,       -- accountant's statement line; letters = balance sheet, numbers = income statement
+        Prelim         DECIMAL(12,2)  NULL,       -- should equal QuickBooks at the year end
+        Adj            DECIMAL(12,2)  NULL,
+        Reclass        DECIMAL(12,2)  NULL,
+        Final          DECIMAL(12,2)  NULL,       -- what is in the financial statements
+        PriorYearFinal DECIMAL(12,2)  NULL,
+        Annotation     NVARCHAR(100)  NULL,
+        SourceDoc      NVARCHAR(200)  NULL,
+        LoadedAt       DATETIME2      NOT NULL CONSTRAINT DF_YETB_LoadedAt DEFAULT (SYSDATETIME()),
+        CONSTRAINT PK_YearEndTB PRIMARY KEY (TBID),
+        CONSTRAINT UQ_YearEndTB UNIQUE (Company, FiscalYearEnd, AccountNo)
+    );
+END
+GO
+
+-- ------------------------------------------------------------
+-- fin.vw_YearEndTB_vs_QB: each accountant TB line next to QuickBooks at the same year end.
+--   Side       'BS' balance sheet / 'IS' income statement - from the FSLine (M&Co's balance-sheet
+--              lines start with a letter, income-statement lines with a number), else from the QB type
+--   QBAmount   BS: qb.AccountBalances closing; IS: sum of qb.JournalEntryLines in the fiscal year
+--   InQB       0 = account is not in this company's QuickBooks chart (M&Co-only, e.g. 5000, 22201, 90000)
+--   QBYearLoaded 0 = QuickBooks has no data for that fiscal year, so QBAmount means nothing
+--   PrelimLessQB  Prelim - QBAmount; non-zero = QuickBooks changed since the accountant's copy, or a mapping
+-- ------------------------------------------------------------
+IF OBJECT_ID('fin.vw_YearEndTB_vs_QB', 'V') IS NOT NULL
+    DROP VIEW fin.vw_YearEndTB_vs_QB;
+GO
+
+CREATE VIEW fin.vw_YearEndTB_vs_QB AS
+SELECT
+    t.Company, t.FiscalYearEnd, t.AccountNo, t.AccountName, t.FSLine, side.Side,
+    CAST(CASE WHEN coa.ChartAccountID IS NULL THEN 0 ELSE 1 END AS BIT) AS InQB,
+    coa.AccountName AS QBAccountName, coa.AccountType AS QBAccountType,
+    CAST(CASE WHEN yl.Loaded = 1 THEN 1 ELSE 0 END AS BIT) AS QBYearLoaded,
+    t.Prelim, t.Adj, t.Reclass, t.Final, t.PriorYearFinal,
+    q.QBAmount,
+    CAST(t.Prelim - q.QBAmount AS DECIMAL(14,2)) AS PrelimLessQB,
+    t.Annotation
+FROM fin.YearEndTB t
+LEFT JOIN qb.Companies c ON c.CompanyCode = t.Company
+LEFT JOIN qb.ChartOfAccounts coa ON coa.CompanyID = c.CompanyID AND coa.AccountNumber = t.AccountNo
+CROSS APPLY (SELECT CASE
+        WHEN t.FSLine LIKE '[0-9]%' THEN 'IS'
+        WHEN t.FSLine IS NOT NULL AND LTRIM(t.FSLine) <> '' THEN 'BS'
+        WHEN coa.AccountType IN ('Income', 'Other Income', 'Expense', 'Other Expense', 'Cost of Goods Sold') THEN 'IS'
+        ELSE 'BS' END AS Side) side
+CROSS APPLY (SELECT DATEFROMPARTS(t.FiscalYearEnd - 1, COALESCE(c.FiscalYearStartMonth, 9), 1) AS FYStart,
+                    EOMONTH(DATEFROMPARTS(t.FiscalYearEnd, COALESCE(c.FiscalYearStartMonth, 9), 1), -1) AS FYEnd) d
+OUTER APPLY (SELECT TOP 1 1 AS Loaded FROM qb.AccountBalances b
+             WHERE b.CompanyID = c.CompanyID AND b.FiscalYearEnd = t.FiscalYearEnd) yl
+OUTER APPLY (
+    SELECT CAST(CASE
+        WHEN coa.ChartAccountID IS NULL OR yl.Loaded IS NULL THEN NULL
+        WHEN side.Side = 'BS' THEN COALESCE((SELECT b.ClosingBalance FROM qb.AccountBalances b
+                                             WHERE b.CompanyID = c.CompanyID AND b.ChartAccountID = coa.ChartAccountID
+                                               AND b.FiscalYearEnd = t.FiscalYearEnd), 0)
+        ELSE COALESCE((SELECT SUM(l.Amount) FROM qb.JournalEntryLines l
+                       JOIN qb.JournalEntries e ON e.JournalEntryID = l.JournalEntryID
+                       WHERE l.ChartAccountID = coa.ChartAccountID AND e.CompanyID = c.CompanyID
+                         AND e.TxnDate BETWEEN d.FYStart AND d.FYEnd), 0)
+        END AS DECIMAL(14,2)) AS QBAmount
+) q;
+GO
+
+-- ------------------------------------------------------------
+-- fin.vw_YearEndCarryForward: balance-sheet accounts only - the accountant's Final at the year end
+-- against QuickBooks' closing balance that day. FinalLessQB is the cumulative adjustment that never
+-- reached QuickBooks (an M&Co-only account counts as 0 in QuickBooks).
+-- e.g. SUM(FinalLessQB) WHERE FSLine = 'CC Advances from related party' per Company / FiscalYearEnd.
+-- ------------------------------------------------------------
+IF OBJECT_ID('fin.vw_YearEndCarryForward', 'V') IS NOT NULL
+    DROP VIEW fin.vw_YearEndCarryForward;
+GO
+
+CREATE VIEW fin.vw_YearEndCarryForward AS
+SELECT
+    v.Company, v.FiscalYearEnd,
+    EOMONTH(DATEFROMPARTS(v.FiscalYearEnd, COALESCE(c.FiscalYearStartMonth, 9), 1), -1) AS AsOfDate,
+    v.AccountNo, v.AccountName, v.FSLine, v.InQB, v.QBYearLoaded,
+    v.Final,
+    CAST(CASE WHEN v.QBYearLoaded = 1 THEN COALESCE(v.QBAmount, 0) END AS DECIMAL(14,2)) AS QBClosing,
+    CAST(CASE WHEN v.QBYearLoaded = 1 THEN v.Final - COALESCE(v.QBAmount, 0) END AS DECIMAL(14,2)) AS FinalLessQB
+FROM fin.vw_YearEndTB_vs_QB v
+LEFT JOIN qb.Companies c ON c.CompanyCode = v.Company
+WHERE v.Side = 'BS';
+GO
+
+-- ------------------------------------------------------------
+-- fin.vw_YearEndFSLines: Final (and prior-year Final) summed by the accountant's statement line,
+-- plus one 'Net income' row per company and year (income-statement lines, credit shown positive).
+-- ------------------------------------------------------------
+IF OBJECT_ID('fin.vw_YearEndFSLines', 'V') IS NOT NULL
+    DROP VIEW fin.vw_YearEndFSLines;
+GO
+
+CREATE VIEW fin.vw_YearEndFSLines AS
+WITH s AS (
+    SELECT Company, FiscalYearEnd, COALESCE(NULLIF(LTRIM(FSLine), ''), '(no line)') AS FSLine,
+           CASE WHEN FSLine LIKE '[0-9]%' THEN 'IS' ELSE 'BS' END AS Side,
+           Final, PriorYearFinal, Prelim
+    FROM fin.YearEndTB
+)
+SELECT Company, FiscalYearEnd, Side, FSLine, COUNT(*) AS Accounts,
+       CAST(SUM(Prelim) AS DECIMAL(14,2)) AS Prelim,
+       CAST(SUM(Final) AS DECIMAL(14,2)) AS Final,
+       CAST(SUM(PriorYearFinal) AS DECIMAL(14,2)) AS PriorYearFinal
+FROM s GROUP BY Company, FiscalYearEnd, Side, FSLine
+UNION ALL
+SELECT Company, FiscalYearEnd, 'NI', 'Net income', COUNT(*),
+       CAST(-SUM(Prelim) AS DECIMAL(14,2)), CAST(-SUM(Final) AS DECIMAL(14,2)), CAST(-SUM(PriorYearFinal) AS DECIMAL(14,2))
+FROM s WHERE Side = 'IS' GROUP BY Company, FiscalYearEnd;
+GO

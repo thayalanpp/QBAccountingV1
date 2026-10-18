@@ -89,6 +89,7 @@ python split_pipeline.py --fy-end <Y>
 python board_seed.py                                    (board posts, incl. the JE-1..JE-7 proposal)
 python proposed_entries.py seed                         (fin.ProposedEntries / Lines)
 python proposed_entries.py proforma --check             (fin.vw_ProForma22200 vs the report)
+python load_yearend.py --all                            (M&Co AJEs + closing TB, after the QB loads)
 ```
 Reloading QuickBooks gives its lines new IDs - **always rerun visa and bank after a QB reload**. A QB reload also rewrites that year's qb.AccountBalances with a 0 opening - **always rerun load_gl_balances.py after it**. Every pipeline replaces its own year (never duplicates); a failed validation saves nothing.
 """, status="Resolved")
@@ -337,6 +338,25 @@ post("bld-proposed-entries", "build-architecture", "build_agent", "Fact", "clean
 | iif_export.py | Writes **Approved** entries only to a QuickBooks Desktop IIF (accounts by full name from qb.ChartOfAccounts; creates 39900 via !ACCNT; JE-6 as a Credit Card Charge); refuses unbalanced or undecided entries; stamps IIFExportedAt |
 Status flow: Draft -> Approved -> Posted (in the backup copy), or Rejected / Superseded. Dates are written MM/DD/YYYY by default (`--date-format dmy` if QuickBooks reads day first) - check one entry in the register after the import.
 """, status="Resolved")
+
+post("bld-yearend", "build-architecture", "build_agent", "Fact", "yearend", None, None,
+     "Accountant's year-end files: tables, loader and views", """
+M&Co's adjusting entries never reach QuickBooks, so their figures are loaded alongside the QuickBooks data to compare year by year.
+| Piece | Does |
+|---|---|
+| fin.YearEndAJE | M&Co's AJE lines (Debit / Credit positive; IsRollForward = "to record last year adjustment") |
+| fin.YearEndTB | M&Co's closing TB: Prelim + Adj + Reclass = Final, debit + / credit -, with the FS line |
+| load_yearend.py | `--company dntl --fy 2025` or `--all`; replaces company x year; refuses to save unless AJEs balance, TB columns sum to 0, every row adds up and TB Adj = AJE net per account. Reports PriorYearFinal continuity, Prelim vs QuickBooks, and M&Co-only accounts |
+| fin.vw_YearEndTB_vs_QB | Each TB line vs QuickBooks at the year end (balance sheet: AccountBalances closing; P&L: the year's activity) |
+| fin.vw_YearEndCarryForward | Balance-sheet Final vs QuickBooks closing: the cumulative adjustment never posted to QuickBooks |
+| fin.vw_YearEndFSLines | Final by statement line, plus a Net income row, to compare with the PDF statements |
+Files: C:\\NM\\<FY>yearend\\<co>\\accountant\\YearEndTB_<co>_<FY>.csv and YearEndAJE_<co>_<FY>.csv (CSVs prepared from the PDFs; the loader does not read PDFs).
+FY2025 Dental: 36 TB rows, 6 AJEs (17 lines, 209,368.21 each side), CC group Final 25,137.22, net income 47,997.35. No IIF of AJEs until it is decided whether to record them.
+""", status="Resolved")
+post("bld-task-yearend-history", "build-backlog", "build_agent", "Task", "yearend", "dntl", None,
+     "Accountant's files for FY2021-FY2024 (Dental), then Hygiene", """
+Prepare YearEndTB / YearEndAJE CSVs for Dental FY2021-FY2024 and load them oldest first (`python load_yearend.py --all`), so each year's PriorYearFinal is checked against the year before. Then check fin.vw_YearEndCarryForward for the CC group (22100 + 22150 + 22200 + 22201 + 31400) at Aug 31 2023, 2024 and 2025 (expected around 15,000 each year). Hygiene's files use the same tables when they arrive.
+""", priority=2)
 
 
 def seed(engine):

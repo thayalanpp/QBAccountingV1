@@ -1,8 +1,8 @@
-# QBAccountingV1 - handoff (2026-10-03)
+# QBAccountingV1 - handoff (2026-10-18)
 
 Paste this at the start of a new chat. It is the project's message board: decisions, facts, findings, proposals, open tasks and questions, posted by the agents below. Full detail lives in SQL (agent.Messages, fin.Findings) and in the review workbooks.
 
-**Agents:** `build_agent` - Developer who built the QBAccountingV1 application; `dental_agent` - Bookkeeper for S. Viswanathan Dentistry Professional Corporation (DNTL); `hygiene_agent` - Bookkeeper for DHM Dental Hygiene Technical Services Corporation (HYG); `mgmt_agent` - Bookkeeper for the Management company (MGMT); `owner` - Thayalan - owner, decision maker
+**Agents:** `owner` - Thayalan - owner, decision maker; `build_agent` - Developer who built the QBAccountingV1 application; `dental_agent` - Bookkeeper for S. Viswanathan Dentistry Professional Corporation (DNTL); `hygiene_agent` - Bookkeeper for DHM Dental Hygiene Technical Services Corporation (HYG); `mgmt_agent` - Bookkeeper for the Management company (MGMT)
 
 ## Context
 
@@ -126,6 +126,7 @@ python split_pipeline.py --fy-end <Y>
 python board_seed.py                                    (board posts, incl. the JE-1..JE-7 proposal)
 python proposed_entries.py seed                         (fin.ProposedEntries / Lines)
 python proposed_entries.py proforma --check             (fin.vw_ProForma22200 vs the report)
+python load_yearend.py --all                            (M&Co AJEs + closing TB, after the QB loads)
 ```
 Reloading QuickBooks gives its lines new IDs - **always rerun visa and bank after a QB reload**. A QB reload also rewrites that year's qb.AccountBalances with a 0 opening - **always rerun load_gl_balances.py after it**. Every pipeline replaces its own year (never duplicates); a failed validation saves nothing.
 
@@ -169,6 +170,21 @@ Reads page 1's two columns separately; dates get their year from the statement p
 | proposed_entries.py | `seed` (rerunnable; Draft entries are rewritten, Approved/Posted are never touched), `list`, `set-account`, `approve`, `reject`, `mark-posted`, `proforma --check` |
 | iif_export.py | Writes **Approved** entries only to a QuickBooks Desktop IIF (accounts by full name from qb.ChartOfAccounts; creates 39900 via !ACCNT; JE-6 as a Credit Card Charge); refuses unbalanced or undecided entries; stamps IIFExportedAt |
 Status flow: Draft -> Approved -> Posted (in the backup copy), or Rejected / Superseded. Dates are written MM/DD/YYYY by default (`--date-format dmy` if QuickBooks reads day first) - check one entry in the register after the import.
+
+### Accountant's year-end files: tables, loader and views
+*build_agent · Fact · yearend*
+
+M&Co's adjusting entries never reach QuickBooks, so their figures are loaded alongside the QuickBooks data to compare year by year.
+| Piece | Does |
+|---|---|
+| fin.YearEndAJE | M&Co's AJE lines (Debit / Credit positive; IsRollForward = "to record last year adjustment") |
+| fin.YearEndTB | M&Co's closing TB: Prelim + Adj + Reclass = Final, debit + / credit -, with the FS line |
+| load_yearend.py | `--company dntl --fy 2025` or `--all`; replaces company x year; refuses to save unless AJEs balance, TB columns sum to 0, every row adds up and TB Adj = AJE net per account. Reports PriorYearFinal continuity, Prelim vs QuickBooks, and M&Co-only accounts |
+| fin.vw_YearEndTB_vs_QB | Each TB line vs QuickBooks at the year end (balance sheet: AccountBalances closing; P&L: the year's activity) |
+| fin.vw_YearEndCarryForward | Balance-sheet Final vs QuickBooks closing: the cumulative adjustment never posted to QuickBooks |
+| fin.vw_YearEndFSLines | Final by statement line, plus a Net income row, to compare with the PDF statements |
+Files: C:\NM\<FY>yearend\<co>\accountant\YearEndTB_<co>_<FY>.csv and YearEndAJE_<co>_<FY>.csv (CSVs prepared from the PDFs; the loader does not read PDFs).
+FY2025 Dental: 36 TB rows, 6 AJEs (17 lines, 209,368.21 each side), CC group Final 25,137.22, net income 47,997.35. No IIF of AJEs until it is decided whether to record them.
 
 ## dental_agent - facts and findings
 
@@ -221,6 +237,8 @@ After all proposed entries 22200 = **2,009.95 Cr** at Aug 31 2025 vs the card's 
 | QB card entries with no card line | 174.10 | none yet | 174.10 |
 | **Total** | | | **1,600.96** |
 The 2,167.25 looks like timing/treatment, not new errors: split payments booked after the year-end they belong to (~1,617.66 net, Aug 2024 / Aug 2025 sheets), the Lopez 2,486.00 payment from a group bank account, and the 1,936.41 July credits. Confirm before JE-5 is final - part may belong in FY2026.
+
+_Replaces: an earlier working figure (un-seeded post)_
 
 _Evidence: fin.vw_ProForma22200 (FiscalYearEnd 2025, ProFormaOverCard); reconciliation report Proof_
 
@@ -341,6 +359,11 @@ Out of scope for this set (by decision): the Aug 2024 split accrual (9,525.04) a
 1. Separate line for the previous year's August split cheque paid in September (e.g. cheque 23, visa portion 3,991.57).
 2. Group matching card charges and credits that wash out (personal travel) so they show as 0.
 3. Year-end accrual figure in the review = unpaid C8 at Aug 31 (9,525.04 at Aug 31 2024; 0 at Aug 31 2025).
+
+### Accountant's files for FY2021-FY2024 (Dental), then Hygiene
+*build_agent · Task · yearend · dntl*
+
+Prepare YearEndTB / YearEndAJE CSVs for Dental FY2021-FY2024 and load them oldest first (`python load_yearend.py --all`), so each year's PriorYearFinal is checked against the year before. Then check fin.vw_YearEndCarryForward for the CC group (22100 + 22150 + 22200 + 22201 + 31400) at Aug 31 2023, 2024 and 2025 (expected around 15,000 each year). Hygiene's files use the same tables when they arrive.
 
 ### Later
 *build_agent · Task · build*
