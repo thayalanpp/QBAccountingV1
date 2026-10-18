@@ -71,6 +71,33 @@ The end product of the analysis is a set of **QuickBooks journal entries**. They
 
 Future design: a **dental_agent** and a **hygiene_agent** (mgmt later) - each with this project's knowledge - check that each company is charged correctly and collaborate through this board. The AI fallback for PDF reading is on hold; rule-based parsers are used.
 
+### Lopez charges are Hygiene's
+*owner · Decision · split · dntl · FY2025*
+
+The Lopez Senathi & Associates charges on the card (2,486.00 + 2,062.25 = **4,548.25**, Mar 2025 cycle) are **Hygiene's**. The bookkeeper moved them to a Hygiene account and they were paid by two separate payments on Feb 12 2025; they are correctly left out of Dental's QuickBooks.
+They should not have been in the March 2025 split, so Dental's 80% of them (**3,638.60**) is part of what Hygiene owes Dental (JE-5).
+
+### July 2025 credits of 1,936.41 treated as Hygiene's payments
+*owner · Decision · split · dntl · FY2025*
+
+The July 2025 card payment credits that did not come from Hygiene's bank (1,664.48, 152.55, 84.05, 35.33 = **1,936.41**) are **assumed to be Hygiene's payments** for now, at the owner's direction.
+Effect: they count as real payments to TD, so they are not "booked but not paid". This is exactly why the figures dropped: booked-not-paid 19,613.76 -> **17,677.35** (-1,936.41) and Dental over-charged 15,691.00 -> **14,141.87** (-1,549.13 = 80%).
+If they prove to be personal payments, Dental's over-charge rises by 1,549.13 and JE-5 changes; revisit before the accountant finalises JE-5.
+
+### Visa split from now on: 80/20 monthly, one year-end lab adjustment
+*owner · Decision · split · FY2026*
+
+Agreed with the bookkeeper (Shaju Paul CPA):
+- Each month split the Visa **80% Dental / 20% Hygiene**, using only that statement's **own new charges**: never the full balance, never charges paid separately, net of credits and refunds.
+- **One year-end adjustment** moves Hygiene's 20% of lab fees (100% Dental items) back to Dental. Lab vendors are posted to a dedicated "Lab fees - Visa" account so the total is ready at year-end.
+- The lab-fee allocation for FY2024/FY2025 (a further **3,967.90** if the unlisted D6 amounts are not labs) is a separate matter, **not part of the 22200 fix**.
+
+### Aug 2024 split accrual is outside the 22200 fix
+*owner · Decision · cleanup · dntl · FY2024*
+
+The Aug 2024 sheet's cheque (C8 9,525.04, cheque 23, paid Sep 3 2024) means Dental owed Hygiene 9,525.04 at Aug 31 2024 with nothing recorded. That accrual is a **22100 / expense cut-off matter**, not a 22200 error, and is **not** part of JE-1 to JE-7.
+(The 22200 effect of year-end cheque timing - about 1,617.66 net - is one of the parts of the remaining 1,600.96; see "FY2025: 1,600.96 still to explain".)
+
 ## build_agent - how the application works
 
 ### Application: pipelines and files
@@ -96,6 +123,9 @@ python load_gl_balances.py --company dntl [--last-fy <Y>]
 python visa_pipeline.py --fy-end <Y>
 python bank_pipeline.py --fy-end <Y> --only dntl,hyg
 python split_pipeline.py --fy-end <Y>
+python board_seed.py                                    (board posts, incl. the JE-1..JE-7 proposal)
+python proposed_entries.py seed                         (fin.ProposedEntries / Lines)
+python proposed_entries.py proforma --check             (fin.vw_ProForma22200 vs the report)
 ```
 Reloading QuickBooks gives its lines new IDs - **always rerun visa and bank after a QB reload**. A QB reload also rewrites that year's qb.AccountBalances with a 0 opening - **always rerun load_gl_balances.py after it**. Every pipeline replaces its own year (never duplicates); a failed validation saves nothing.
 
@@ -128,6 +158,18 @@ Reads page 1's two columns separately; dates get their year from the statement p
 - QB postings: cheque found by number, or by amount and date when the bank has no numbers (FY2024); 2-cent rounding tolerance.
 - Boundary months (last month of the previous year, first of the next) come from the neighbouring NM_<year>.xlsx and are kept out of the totals.
 
+### Proposed entries: tables, approval and IIF
+*build_agent · Fact · cleanup*
+
+| Piece | Does |
+|---|---|
+| fin.ProposedEntries / fin.ProposedEntryLines | One row per entry (JE-1 ... TM-1R) and its legs, debit + / credit -, company QB account numbers; undecided accounts keep AccountNumber NULL + AccountHint |
+| fin.vw_ProposedEntries | Per entry: balanced?, undecided lines, ReadyToApprove, effect on 22200 |
+| fin.vw_ProForma22200 | Dental 22200 at each Aug 31: QB (multi-year GL), + proposed entries (all / approved only), vs card owed that day |
+| proposed_entries.py | `seed` (rerunnable; Draft entries are rewritten, Approved/Posted are never touched), `list`, `set-account`, `approve`, `reject`, `mark-posted`, `proforma --check` |
+| iif_export.py | Writes **Approved** entries only to a QuickBooks Desktop IIF (accounts by full name from qb.ChartOfAccounts; creates 39900 via !ACCNT; JE-6 as a Credit Card Charge); refuses unbalanced or undecided entries; stamps IIFExportedAt |
+Status flow: Draft -> Approved -> Posted (in the backup copy), or Rejected / Superseded. Dates are written MM/DD/YYYY by default (`--date-format dmy` if QuickBooks reads day first) - check one entry in the register after the import.
+
 ## dental_agent - facts and findings
 
 ### 22200 vs the real card balance ⚑
@@ -142,14 +184,45 @@ FY2024 moved the gap only **+123.68** (wrong-sign entries). FY2025 added **19,77
 
 _Evidence: split_review_FY2025.xlsx sheet 22200 roll-forward (opens from the GL balance; unexplained 0.00)_
 
-### FY2025 split: B6 overstated after missed payments ⚑
+### FY2025 split: Hygiene owes Dental 14,141.87 ⚑
 *dental_agent · Finding · split · dntl · FY2025*
 
-Cash (booked as paid on 22200 but not paid): Feb 10,669.85 · Mar 676.63 · Jun 599.00 · Jul 7,668.28 = **19,613.76**.
-Expense (Dental visa portion vs the cycle's own charges): Mar -3,355.83 · Apr -5,721.35 · Jun -479.20 · Jul -1,567.20 · Aug -4,567.42 = **-15,691.00** (Dental over-charged).
-Year: sum of B6 110,524.28 vs paid to TD 90,910.52 = the cycles' own charges 90,910.52. Started Feb 2025 (first missed payment); FY2024 unaffected.
+Replaces the earlier Dental-visa-expense figure of **-15,691.00**. Dental was over-charged through the split cheques by **14,141.87**:
+| Cause | Split in error | Dental over-charged (80%) | Hygiene's 20% |
+|---|---|---|---|
+| Issue 1 - past balance split again: Apr 2025 (7,151.69), Aug 2025 (5,709.28) | 12,860.97 | 10,288.77 | 2,572.20 |
+| Issue 2 - Lopez 4,548.25 (Mar), interest credit not deducted 245.54 (Mar), Jul 22.59; 599.00 fee Mar/Jun nets 0 | 4,816.38 | 3,853.10 | 963.28 |
+| **Total** | **17,677.35** | **14,141.87** | **3,535.48** |
+Difference from 15,691.00 = 1,549.13 = 80% of the 1,936.41 July credits now treated as Hygiene's. FY2024 needs no split correction.
 
-_Evidence: split_review_FY2025.xlsx; fin.SplitMonths FY2025_
+_Replaces: FY2025 split: B6 overstated after missed payments (superseded)_
+
+_Evidence: Reconciliation report Issues 1-2; split_review_FY2025.xlsx_
+
+### FY2025 split: 17,677.35 booked as paid on 22200 but never paid to TD ⚑
+*dental_agent · Finding · split · dntl · FY2025*
+
+Replaces the earlier cash figure of **19,613.76**. The split cheques' visa portions plus the hygiene-supplies journals recorded **17,677.35** of card payments TD never received (Issue 1 12,860.97 + Issue 2 4,816.38). Reversing them is **JE-5** (Cr 22200 17,677.35; Dr 22100 Due from Hygiene 14,141.87; Dr 64400 Dental Supplies 3,535.48).
+Difference from 19,613.76 = 1,936.41, the July credits now treated as Hygiene's payments. Over FY2025 Hygiene paid TD exactly the cycles' own charges (90,910.52); only the bookkeeping went beyond that.
+
+_Replaces: FY2025 split: B6 overstated after missed payments (superseded)_
+
+_Evidence: Reconciliation report Issue 1-2 tables; JE-5_
+
+### FY2025: 1,600.96 still to explain after JE-1 to JE-7 ⚑
+*dental_agent · Finding · rollforward · dntl · FY2025*
+
+Replaces the earlier working figure of **1,513.66**, which did not allow for the 87.30 FY2024 timing item reversing in FY2025 (1,513.66 + 87.30 = 1,600.96).
+After all proposed entries 22200 = **2,009.95 Cr** at Aug 31 2025 vs the card's **408.99** (Aug 31 2024 lands exactly on 3,430.48).
+| FY2025 roll-forward line | Roll-forward | Covered by entries | Left |
+|---|---|---|---|
+| Payments booked vs made | 15,510.10 | 17,677.35 (JE-5) | 2,167.25 |
+| Card activity not in QB | 4,350.15 | 3,609.76 (JE-6, JE-7) | -740.39 |
+| QB card entries with no card line | 174.10 | none yet | 174.10 |
+| **Total** | | | **1,600.96** |
+The 2,167.25 looks like timing/treatment, not new errors: split payments booked after the year-end they belong to (~1,617.66 net, Aug 2024 / Aug 2025 sheets), the Lopez 2,486.00 payment from a group bank account, and the 1,936.41 July credits. Confirm before JE-5 is final - part may belong in FY2026.
+
+_Evidence: fin.vw_ProForma22200 (FiscalYearEnd 2025, ProFormaOverCard); reconciliation report Proof_
 
 ### Dental's key accounts: purpose and balances
 *dental_agent · Fact · qb · dntl*
@@ -179,7 +252,7 @@ Credited with every card charge (expensed 100% in Dental). Debited by (1) the sp
 *dental_agent · Finding · rollforward · dntl · FY2025*
 
 - Payments booked vs made: journals 8,056.37 + cheque visa portions 100,850.25 booked vs 93,396.52 paid = **-15,510.10** (the paid figure includes Lopez 2,486 which is not a group payment; ~1,617.66 of booked items cross the year boundary: cheque 23, negative GJ 63).
-- Card activity not in QB: **-4,350.15** = Lopez 2,486 (washes out with its Scotiabank payment) + **Align 3,534.52 missing from QB** + Amazon 74.58 + Abeldent 124.84 + Amazon 66.62 - **personal payments against business charges 1,936.41** (Jul: 1,664.48, 152.55, 84.05, 35.33). All travel items (Air Canada, American Airlines incl. the 18,120.92 cash advances) wash out to 0.
+- Card activity not in QB: **-4,350.15** = Lopez 2,486 (washes out with its Scotiabank payment) + **Align 3,534.52 missing from QB** + Amazon 74.58 + Abeldent 124.84 + Amazon 66.62 - **payments not from Hygiene's bank 1,936.41** (Jul: 1,664.48, 152.55, 84.05, 35.33; treated as Hygiene's payments - see decision). All travel items (Air Canada, American Airlines incl. the 18,120.92 cash advances) wash out to 0.
 - QB entries with no card line: +174.10. Timing: -87.30. Unexplained: 0.00.
 
 _Evidence: split_review_FY2025.xlsx sheets 22200 roll-forward / Roll-forward lines_
@@ -214,26 +287,53 @@ Two SCOTIABANK PAYMENTs of 3,391.85 (Jul 20 and Jul 25 2023) paid the same balan
 
 ## Proposals awaiting a decision
 
-### Clean-up entries dated Aug 31 2023 (backup copy) ⚑
-*dental_agent · Proposal · cleanup · dntl · FY2023*
+### Proposed entries JE-1 to JE-7 (Dental, backup copy) ⚑
+*dental_agent · Proposal · cleanup · dntl · FY2025*
 
-Create **39900 Suspense - pre-FY2024 differences** (Equity). No income or expense changes in any year.
-- **JE-1 (required):** Dr 39900 15,772.83 / Cr 22200 15,772.83 - sets 22200 to the card balance (6,270.35 owed per the Sep 6 2023 statement). After it, the Aug 31 2024 gap should drop to ~123.68.
-- JE-2 (optional): Dr 22100 7,646.88 / Cr 39900 7,646.88.
-- JE-3 (optional): Dr 39900 12,500.00 / Cr 22150 12,500.00.
-Posting into FY2023 needs the closing-date password. Real books: accountant's decision.
+Seven entries in Dental's books bring 22200 back to the card; held in **fin.ProposedEntries** (Draft until approved). Only JE-5 involves Hygiene (matching entry needed in Hygiene's books).
+| No. | Date | Debit | Credit | Amount | Fixes |
+|---|---|---|---|---|---|
+| JE-1 | Aug 31 2023 | 39900 Suspense (new, Equity) | 22200 | 15,772.83 | Pre-FY2024 difference, parked |
+| JE-2 | FY2024 (card dates) | 22200 89.45 net | Telephone / internet | 89.45 | Bell 237.64 as 327.64 (+90.00), Bell 238.92 as 238.49 (-0.43), Google 9.35 as 9.23 (-0.12) |
+| JE-3 | FY2024 (card dates) | Expense (per charge) | 22200 | 302.45 | Two FY2024 charges never entered |
+| JE-4 | Aug 31 2024 | 22200 | 64400 Dental Supplies | 2.02 | Rounding on FY2024 split payments |
+| JE-5 | Aug 31 2025 | 22100 Due from Hygiene 14,141.87; 64400 3,535.48 | 22200 | 17,677.35 | Issues 1-2: split payments booked, not made |
+| JE-6 | Feb 3 2025 | Lab fees | 22200 | 3,534.52 | Align never entered (Credit Card Charge) |
+| JE-7 | FY2025 (card dates) | Expense (per charge) | 22200 | 75.24 | Feb 74.58 + Aug 0.66 never entered (to identify) |
+Plus **TM-1** (Aug 31 2024, Dr 22200 87.30) and its reversal **TM-1R** (Sep 1 2024): an item recorded in FY2024 that the card posted in FY2025.
+Effect on 22200: JE-1 Cr 15,772.83; FY2024 net Cr 210.98; FY2025 Cr 21,287.11. Pro-forma: Aug 31 2024 **3,430.48 Cr = card**; Aug 31 2025 **2,009.95 Cr vs 408.99** (1,600.96 open).
+Replaces the earlier numbering where JE-2/JE-3 were the optional intercompany entries (now IC-1/IC-2).
+
+_Replaces: Clean-up entries dated Aug 31 2023 (backup copy) (superseded)_
+
+_Evidence: fin.vw_ProposedEntries; fin.vw_ProForma22200; reconciliation report 'Proposed adjustments'_
 
 ### Process from FY2026: accrue the split to 22100
 *dental_agent · Proposal · cleanup · dntl · FY2026*
 
 At each sheet's month-end: Dr expense accounts (DPC portions), Dr 22200 (visa portion), **Cr 22100 Due to Hygiene** (C8). When the cheque is written: Dr 22100 / Cr 10000. Timing then no longer matters; 22100 shows the unpaid split at any date. Clear 22100's old 7,646.88 first.
 
+### Optional intercompany clean-up IC-1 / IC-2 (Aug 31 2023)
+*dental_agent · Proposal · cleanup · dntl · FY2023*
+
+Formerly numbered JE-2 / JE-3; renumbered so JE-1 to JE-7 match the reconciliation report. Not seeded in fin.ProposedEntries.
+- IC-1: Dr 22100 7,646.88 / Cr 39900 7,646.88 (dormant since GJ 27, Aug 31 2022).
+- IC-2: Dr 39900 12,500.00 / Cr 22150 12,500.00 (cheque 129 to Management, May 3 2023; no matching account in MGMT).
+Wait for Hygiene's and Management's books (see "Intercompany balances don't agree"). Note JE-5 also uses 22100.
+
+_Replaces: Clean-up entries dated Aug 31 2023 (backup copy) (superseded)_
+
 ## Open tasks
 
 ### Final deliverable: all correcting journal entries ⚑
 *dental_agent · Task · cleanup · dntl*
 
-Collect into one set (IIF for the backup copy): the Aug 31 2023 entries; FY2024 corrections (wrong-sign charges; 9,525.04 August accrual); FY2025 corrections (19,613.76 booked-not-paid; -15,691.00 Dental visa expense; Align 3,534.52; Abeldent/Amazon; personal payments 1,936.41; GJ 61/63).
+One set, **JE-1 to JE-7** plus the timing pair TM-1 / TM-1R, now held in fin.ProposedEntries (see "Proposed entries JE-1 to JE-7"):
+1. Accountant reviews; owner approves each entry (`python proposed_entries.py approve JE-n --by owner`).
+2. Set the undecided expense accounts first (JE-2, JE-3, JE-6, JE-7, TM-1) - an entry with an undecided account cannot be approved.
+3. `python iif_export.py --company dntl` -> IIF of the Approved entries -> import into the **backup copy**.
+4. Hygiene's matching entry for JE-5 (Due to Dental 14,141.87) - in Hygiene's books, not seeded yet.
+Out of scope for this set (by decision): the Aug 2024 split accrual (9,525.04) and the lab-fee allocation (3,967.90).
 
 ### Roll-forward: timing line, washes-out group, year-end accrual
 *build_agent · Task · rollforward · dntl*
@@ -241,11 +341,6 @@ Collect into one set (IIF for the backup copy): the Aug 31 2023 entries; FY2024 
 1. Separate line for the previous year's August split cheque paid in September (e.g. cheque 23, visa portion 3,991.57).
 2. Group matching card charges and credits that wash out (personal travel) so they show as 0.
 3. Year-end accrual figure in the review = unpaid C8 at Aug 31 (9,525.04 at Aug 31 2024; 0 at Aug 31 2025).
-
-### IIF file for the proposed journal entries
-*build_agent · Task · cleanup*
-
-Generate the clean-up journal entries as a QuickBooks Desktop IIF file (File > Utilities > Import > IIF) for the backup copy.
 
 ### Later
 *build_agent · Task · build*
@@ -262,3 +357,21 @@ Scotiabank PDF transaction reader (for FY2021-2023, beyond the 18-month export w
 3. Personal payments against business charges (1,936.41) - record as owed to the payer (shareholder loan)?
 4. Pre-FY2024 gap 15,772.83 - clear to suspense now (JE-1) or investigate FY2021-2023 first?
 5. Where should corrections for closed years be booked in the real file?
+
+### Open decisions before JE-5 is final ⚑
+*dental_agent · Question · cleanup · dntl · FY2025*
+
+1. Is the **14,141.87** Hygiene owes Dental repaid, or netted against 22100 (Dental currently owes Hygiene 7,646.88, leaving 6,494.99 due to Dental)?
+2. Are the D6 amounts not on the lab list real labs? Settles the further **3,967.90** (separate from 22200).
+3. Date the FY2025 entries in FY2025, or partly in FY2026 where the split cheques were booked after Aug 31 2025?
+4. Expense accounts for JE-2, JE-3, JE-7 and TM-1, and the vendors behind 302.45 (FY2024), 74.58 and 0.66 (FY2025).
+
+## Answers
+
+### Answers (Oct 2026)
+*owner · Answer · dntl · FY2025*
+
+2. Align 3,534.52 (Feb 3 2025) - yes, a Dental lab fee that was never entered: **JE-6**.
+3. Personal payments 1,936.41 - treated as **Hygiene's payments** for now (decision "July 2025 credits of 1,936.41").
+4. Pre-FY2024 gap 15,772.83 - **park in suspense now (JE-1)**; investigate FY2021-FY2023 later.
+Still open: 1 (Hygiene's e-transfer 1,664.48 on Jun 19 2025) and 5 (where closed-year corrections go in the real file).

@@ -874,3 +874,177 @@ SELECT MessageID, ThreadKey, Author, Audience, MsgType, Area, Company, FiscalYea
 FROM agent.Messages
 WHERE Status = 'Open' AND MsgType IN ('Task', 'Question', 'Proposal');
 GO
+
+-- ============================================================
+-- Proposed QuickBooks entries (proposed_entries.py / iif_export.py)
+--   fin.ProposedEntries      one row per proposed entry (JE-1 ... JE-7, TM-1 ...)
+--   fin.ProposedEntryLines   its legs: debit +, credit - (same sign as qb.JournalEntryLines)
+-- The database proposes; people post. An entry goes Draft -> Approved -> Posted
+-- (or Rejected / Superseded). iif_export.py writes Approved entries only.
+-- Accounts are the company's own QuickBooks numbers (text). A leg whose account
+-- is not decided yet keeps AccountNumber NULL and says what is meant in AccountHint;
+-- such an entry cannot be approved or exported until the account is set.
+-- ============================================================
+IF OBJECT_ID('fin.ProposedEntries', 'U') IS NULL
+BEGIN
+    CREATE TABLE fin.ProposedEntries (
+        EntryID          INT IDENTITY(1,1) NOT NULL,
+        EntryKey         NVARCHAR(20)   NOT NULL,   -- 'JE-1' ... ; also the QuickBooks Num (DOCNUM)
+        SeedKey          NVARCHAR(100)  NULL,       -- set when written by proposed_entries.py seed
+        CompanyID        INT            NOT NULL,
+        EntryDate        DATE           NOT NULL,
+        FiscalYearEnd    SMALLINT       NOT NULL,
+        QBTxnType        NVARCHAR(40)   NOT NULL CONSTRAINT DF_PE_TxnType DEFAULT ('General Journal'),  -- or 'Credit Card Charge'
+        Kind             NVARCHAR(20)   NOT NULL CONSTRAINT DF_PE_Kind DEFAULT ('Correction'),       -- Correction | Timing | Reversal
+        Name             NVARCHAR(200)  NULL,       -- payee (Credit Card Charge)
+        Title            NVARCHAR(200)  NOT NULL,
+        Memo             NVARCHAR(400)  NULL,       -- goes to QuickBooks
+        Explanation      NVARCHAR(MAX)  NULL,       -- why; for the accountant
+        DateBasis        NVARCHAR(100)  NULL,       -- e.g. 'card date' when EntryDate is a stand-in
+        ReversesEntryID  INT            NULL,
+        MessageID        INT            NULL,       -- agent.Messages post that proposes it
+        Evidence         NVARCHAR(1000) NULL,
+        Status           NVARCHAR(20)   NOT NULL CONSTRAINT DF_PE_Status DEFAULT ('Draft'),
+        StatusBy         NVARCHAR(40)   NULL,
+        StatusAt         DATETIME2      NULL,
+        StatusNote       NVARCHAR(400)  NULL,
+        IIFFile          NVARCHAR(400)  NULL,
+        IIFExportedAt    DATETIME2      NULL,
+        CreatedAt        DATETIME2      NOT NULL CONSTRAINT DF_PE_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        UpdatedAt        DATETIME2      NULL,
+        CONSTRAINT PK_ProposedEntries PRIMARY KEY (EntryID),
+        CONSTRAINT UQ_ProposedEntries_Key UNIQUE (CompanyID, EntryKey),
+        CONSTRAINT FK_PE_Companies FOREIGN KEY (CompanyID) REFERENCES qb.Companies(CompanyID),
+        CONSTRAINT FK_PE_Reverses FOREIGN KEY (ReversesEntryID) REFERENCES fin.ProposedEntries(EntryID),
+        CONSTRAINT CK_PE_Status CHECK (Status IN ('Draft', 'Approved', 'Rejected', 'Posted', 'Superseded')),
+        CONSTRAINT CK_PE_TxnType CHECK (QBTxnType IN ('General Journal', 'Credit Card Charge'))
+    );
+    CREATE UNIQUE INDEX UX_ProposedEntries_SeedKey ON fin.ProposedEntries(SeedKey) WHERE SeedKey IS NOT NULL;
+END
+GO
+
+IF OBJECT_ID('fin.ProposedEntryLines', 'U') IS NULL
+BEGIN
+    CREATE TABLE fin.ProposedEntryLines (
+        LineID         INT IDENTITY(1,1) NOT NULL,
+        EntryID        INT            NOT NULL,
+        LineNum        SMALLINT       NOT NULL,
+        AccountNumber  NVARCHAR(20)   NULL,       -- the company's QuickBooks account number; NULL = not decided
+        AccountHint    NVARCHAR(200)  NULL,       -- what account is meant, e.g. 'Telephone / internet expense'
+        Amount         DECIMAL(14,2)  NOT NULL,   -- debit +, credit -
+        Name           NVARCHAR(200)  NULL,       -- QuickBooks name on the line, if the account needs one
+        LineMemo       NVARCHAR(400)  NULL,
+        CONSTRAINT PK_ProposedEntryLines PRIMARY KEY (LineID),
+        CONSTRAINT FK_PEL_Entries FOREIGN KEY (EntryID) REFERENCES fin.ProposedEntries(EntryID) ON DELETE CASCADE,
+        CONSTRAINT UQ_PEL_Entry_Line UNIQUE (EntryID, LineNum),
+        CONSTRAINT CK_PEL_Amount CHECK (Amount <> 0),
+        CONSTRAINT CK_PEL_Account CHECK (AccountNumber IS NOT NULL OR AccountHint IS NOT NULL)
+    );
+END
+GO
+
+-- Each proposed entry with its totals: does it balance, are all accounts decided,
+-- and what it does to the account the clean-up is about (22200 by default).
+IF OBJECT_ID('fin.vw_ProposedEntries', 'V') IS NOT NULL
+    DROP VIEW fin.vw_ProposedEntries;
+GO
+
+CREATE VIEW fin.vw_ProposedEntries AS
+SELECT
+    e.EntryID, c.CompanyCode, e.EntryKey, e.EntryDate, e.FiscalYearEnd, e.QBTxnType, e.Kind, e.Title, e.Status,
+    t.LineCount,
+    t.TotalDebit,
+    t.TotalCredit,
+    CAST(CASE WHEN t.NetAmount = 0 THEN 1 ELSE 0 END AS BIT)        AS IsBalanced,
+    t.UnresolvedLines,
+    CAST(CASE WHEN t.NetAmount = 0 AND t.UnresolvedLines = 0 THEN 1 ELSE 0 END AS BIT) AS ReadyToApprove,
+    t.Effect22200,
+    e.ReversesEntryID, e.MessageID, e.IIFExportedAt, e.IIFFile
+FROM fin.ProposedEntries e
+JOIN qb.Companies c ON c.CompanyID = e.CompanyID
+CROSS APPLY (
+    SELECT COUNT(*)                                                       AS LineCount,
+           SUM(CASE WHEN l.Amount > 0 THEN l.Amount ELSE 0 END)           AS TotalDebit,
+           SUM(CASE WHEN l.Amount < 0 THEN -l.Amount ELSE 0 END)          AS TotalCredit,
+           SUM(l.Amount)                                                  AS NetAmount,
+           SUM(CASE WHEN l.AccountNumber IS NULL THEN 1 ELSE 0 END)       AS UnresolvedLines,
+           SUM(CASE WHEN l.AccountNumber = '22200' THEN l.Amount ELSE 0 END) AS Effect22200
+    FROM fin.ProposedEntryLines l
+    WHERE l.EntryID = e.EntryID
+) t;
+GO
+
+-- ------------------------------------------------------------
+-- fin.vw_ProForma22200: Dental's 22200 at each Aug 31, as QuickBooks shows it today,
+-- after the proposed entries, and against what the TD card actually owed that day.
+--   QBBalance       qb.AccountBalances closing (debit +, credit -), from the multi-year GL
+--   AdjAll          proposed entries on 22200 dated on or before the date (not Rejected / Superseded)
+--   AdjApproved     the same, Approved or Posted only
+--   CardOwed        the statement whose period holds the date: opening + lines posted up to the date
+--   ProFormaOwed    -(QBBalance + AdjAll): what the books would say is owed
+--   ProFormaOverCard ProFormaOwed - CardOwed: 0.00 when the books agree with the card
+-- The Aug 31 before the first loaded year comes from that year's opening balance.
+-- ------------------------------------------------------------
+IF OBJECT_ID('fin.vw_ProForma22200', 'V') IS NOT NULL
+    DROP VIEW fin.vw_ProForma22200;
+GO
+
+CREATE VIEW fin.vw_ProForma22200 AS
+WITH acct AS (
+    SELECT c.CompanyID, c.FiscalYearStartMonth, coa.ChartAccountID, al.AccountID AS CardAccountID
+    FROM qb.Companies c
+    JOIN qb.ChartOfAccounts coa ON coa.CompanyID = c.CompanyID AND coa.AccountNumber = '22200'
+    LEFT JOIN fin.AccountLink al ON al.CompanyID = c.CompanyID AND al.ChartAccountID = coa.ChartAccountID
+    WHERE c.CompanyCode = 'dntl'
+),
+checkpoints AS (
+    SELECT a.CompanyID, a.FiscalYearStartMonth, a.CardAccountID, b.FiscalYearEnd, b.ClosingBalance AS QBBalance
+    FROM acct a
+    JOIN qb.AccountBalances b ON b.CompanyID = a.CompanyID AND b.ChartAccountID = a.ChartAccountID
+    UNION ALL
+    SELECT a.CompanyID, a.FiscalYearStartMonth, a.CardAccountID, CAST(b.FiscalYearEnd - 1 AS SMALLINT), b.OpeningBalance
+    FROM acct a
+    JOIN qb.AccountBalances b ON b.CompanyID = a.CompanyID AND b.ChartAccountID = a.ChartAccountID
+    WHERE NOT EXISTS (SELECT 1 FROM qb.AccountBalances p
+                      WHERE p.CompanyID = b.CompanyID AND p.ChartAccountID = b.ChartAccountID
+                        AND p.FiscalYearEnd = b.FiscalYearEnd - 1)
+),
+dated AS (
+    SELECT cp.*,
+           EOMONTH(DATEFROMPARTS(cp.FiscalYearEnd, cp.FiscalYearStartMonth, 1), -1) AS AsOfDate
+    FROM checkpoints cp
+)
+SELECT
+    d.FiscalYearEnd,
+    d.AsOfDate,
+    d.QBBalance,
+    adj.AdjAll,
+    adj.AdjApproved,
+    CAST(d.QBBalance + adj.AdjAll AS DECIMAL(14,2))        AS ProFormaBalance,
+    CAST(-(d.QBBalance + adj.AdjAll) AS DECIMAL(14,2))     AS ProFormaOwed,
+    card.CardOwed,
+    CAST(card.CardOwed + d.QBBalance AS DECIMAL(14,2))     AS QBUnderstatesCard,
+    CAST(-(d.QBBalance + adj.AdjAll) - card.CardOwed AS DECIMAL(14,2))      AS ProFormaOverCard,
+    CAST(-(d.QBBalance + adj.AdjApproved) - card.CardOwed AS DECIMAL(14,2)) AS ApprovedOverCard,
+    card.StatementDate AS CardStatementDate
+FROM dated d
+CROSS APPLY (
+    SELECT CAST(COALESCE(SUM(CASE WHEN e.Status NOT IN ('Rejected', 'Superseded') THEN l.Amount END), 0) AS DECIMAL(14,2)) AS AdjAll,
+           CAST(COALESCE(SUM(CASE WHEN e.Status IN ('Approved', 'Posted') THEN l.Amount END), 0) AS DECIMAL(14,2)) AS AdjApproved
+    FROM fin.ProposedEntries e
+    JOIN fin.ProposedEntryLines l ON l.EntryID = e.EntryID
+    WHERE e.CompanyID = d.CompanyID AND l.AccountNumber = '22200' AND e.EntryDate <= d.AsOfDate
+) adj
+OUTER APPLY (
+    SELECT TOP 1 s.StatementDate,
+           CAST(s.OpeningBalance + COALESCE((SELECT SUM(t.Amount) FROM fin.Transactions t
+                                             WHERE t.StatementID = s.StatementID
+                                               AND COALESCE(t.PostingDate, t.TransactionDate) <= d.AsOfDate), 0)
+                AS DECIMAL(14,2)) AS CardOwed
+    FROM fin.Statements s
+    WHERE s.AccountID = d.CardAccountID
+      AND COALESCE(s.PeriodStart, DATEADD(day, 1, s.PreviousStatementDate), DATEADD(day, -31, s.StatementDate)) <= d.AsOfDate
+      AND s.StatementDate >= d.AsOfDate
+    ORDER BY s.StatementDate
+) card;
+GO

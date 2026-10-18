@@ -21,6 +21,7 @@ SECTIONS = [
     ("Proposals awaiting a decision", lambda p: p["mtype"] == "Proposal"),
     ("Open tasks", lambda p: p["mtype"] == "Task" and p["status"] == "Open"),
     ("Open questions", lambda p: p["mtype"] == "Question" and p["status"] == "Open"),
+    ("Answers", lambda p: p["mtype"] == "Answer"),
 ]
 
 
@@ -30,15 +31,26 @@ def load_from_db():
     with get_engine().connect() as conn:
         agents = conn.execute(text("SELECT AgentKey, Persona FROM agent.Agents ORDER BY AgentKey")).fetchall()
         rows = conn.execute(text("""
-            SELECT ThreadKey, Author, MsgType, Area, Company, FiscalYear, Title, Body, Amount, Evidence, Status, Priority
-            FROM agent.Messages WHERE Status <> 'Superseded' ORDER BY Priority, MessageID""")).fetchall()
-    keys = ["thread", "author", "mtype", "area", "company", "fy", "title", "body", "amount", "evidence", "status", "priority"]
+            SELECT m.ThreadKey, m.Author, m.MsgType, m.Area, m.Company, m.FiscalYear, m.Title, m.Body, m.Amount,
+                   m.Evidence, m.Status, m.Priority, s.Title AS SupersedesTitle
+            FROM agent.Messages m
+            LEFT JOIN agent.Messages s ON s.MessageID = m.SupersedesID
+            WHERE m.Status <> 'Superseded' ORDER BY m.Priority, m.MessageID""")).fetchall()
+    keys = ["thread", "author", "mtype", "area", "company", "fy", "title", "body", "amount", "evidence", "status", "priority",
+            "supersedes_title"]
     return [(a[0], a[1]) for a in agents], [dict(zip(keys, r)) for r in rows]
 
 
 def load_from_seed():
     import board_seed
-    posts = sorted(board_seed.P, key=lambda p: p["priority"])
+    titles = {p["seed_key"]: p["title"] for p in board_seed.P}
+    posts = []
+    for p in sorted(board_seed.P, key=lambda p: p["priority"]):
+        if p["status"] == "Superseded":
+            continue
+        sup = p.get("supersedes")
+        posts.append(dict(p, supersedes_title=titles.get(sup) if sup and not sup.startswith("amount:") else
+                          ("an earlier working figure (un-seeded post)" if sup else None)))
     return [(k, persona) for k, persona, _ in board_seed.AGENTS], posts
 
 
@@ -60,6 +72,8 @@ def render(agents, posts) -> str:
                                                 f"FY{p['fy']}" if p["fy"] else None) if x)
             prio = " ⚑" if p["priority"] == 1 and p["status"] == "Open" else ""
             out += [f"### {p['title']}{prio}", f"*{tags}*", "", p["body"]]
+            if p.get("supersedes_title"):
+                out.append(f"\n_Replaces: {p['supersedes_title']}_")
             if p["evidence"]:
                 out.append(f"\n_Evidence: {p['evidence']}_")
             out.append("")
