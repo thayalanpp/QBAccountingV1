@@ -9,8 +9,9 @@ load_yearend.py - loads the accountant's (M&Co) year-end files into SQL:
     python load_yearend.py --company dntl --fy 2025 --tb "<path>" --aje "<path>"
 
 Inputs are CSVs prepared from the accountant's PDFs (this script does not read PDFs):
-    C:\\NM\\<FY>yearend\\<co>\\accountant\\YearEndTB_<co>_<FY>.csv    (required)
-    C:\\NM\\<FY>yearend\\<co>\\accountant\\YearEndAJE_<co>_<FY>.csv   (optional - a year may have no AJEs)
+    C:\\NM\\accountant\\<co>\\YearEndTB_<co>_<FY>.csv    (required)
+    C:\\NM\\accountant\\<co>\\YearEndAJE_<co>_<FY>.csv   (optional - a year may have no AJEs)
+All years of a company share one folder; keep M&Co's source PDFs there too.
 Signs: TB amounts debit +, credit -. AJE has separate Debit / Credit columns, both positive.
 
 Each run REPLACES that company x year in both tables, in one transaction, and saves nothing if a
@@ -39,7 +40,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-BASE = r"C:\NM"
+BASE = r"C:\NM\accountant"
 COMPANIES = ("dntl", "hyg", "mgmt")
 AJE_COLS = ["Company", "FiscalYearEnd", "AJENumber", "EntryDate", "AccountNo", "AccountName",
             "Debit", "Credit", "Description", "IsRollForward", "SourceDoc"]
@@ -50,7 +51,7 @@ TOL = 0.005
 
 
 def default_path(kind: str, company: str, fy: int, base: str = BASE) -> str:
-    return os.path.join(base, f"{fy}yearend", company, "accountant", f"YearEnd{kind}_{company}_{fy}.csv")
+    return os.path.join(base, company, f"YearEnd{kind}_{company}_{fy}.csv")
 
 
 def _acct(v) -> str:
@@ -221,7 +222,8 @@ def soft_checks(conn, tb: pd.DataFrame, company: str, fy: int) -> List[str]:
         return notes
     start, end = _fy_bounds(fy, co.FiscalYearStartMonth or 9)
     chart = {r.AccountNumber: r for r in conn.execute(text(
-        "SELECT ChartAccountID, AccountNumber, AccountType FROM qb.ChartOfAccounts WHERE CompanyID = :id"), {"id": co.CompanyID})}
+        "SELECT ChartAccountID, AccountNumber, AccountName, AccountType FROM qb.ChartOfAccounts WHERE CompanyID = :id"),
+        {"id": co.CompanyID})}
     loaded = conn.execute(text("SELECT COUNT(*) FROM qb.AccountBalances WHERE CompanyID = :id AND FiscalYearEnd = :y"),
                           {"id": co.CompanyID, "y": fy}).scalar()
     not_in_qb = [a for a in tb["AccountNo"] if a not in chart]
@@ -230,9 +232,10 @@ def soft_checks(conn, tb: pd.DataFrame, company: str, fy: int) -> List[str]:
     if not loaded:
         notes.append(f"6: QuickBooks FY{fy} not loaded for {company} - Prelim not compared")
         return notes
-    bal = {r.ChartAccountID: float(r.ClosingBalance) for r in conn.execute(text(
-        "SELECT ChartAccountID, ClosingBalance FROM qb.AccountBalances WHERE CompanyID = :id AND FiscalYearEnd = :y"),
-        {"id": co.CompanyID, "y": fy})}
+    bal, opening = {}, {}
+    for r in conn.execute(text("""SELECT ChartAccountID, OpeningBalance, ClosingBalance FROM qb.AccountBalances
+                                  WHERE CompanyID = :id AND FiscalYearEnd = :y"""), {"id": co.CompanyID, "y": fy}):
+        bal[r.ChartAccountID], opening[r.ChartAccountID] = float(r.ClosingBalance), float(r.OpeningBalance)
     act = {r.ChartAccountID: float(r.Amt) for r in conn.execute(text("""
         SELECT l.ChartAccountID, SUM(l.Amount) AS Amt FROM qb.JournalEntryLines l
         JOIN qb.JournalEntries e ON e.JournalEntryID = l.JournalEntryID
@@ -244,14 +247,32 @@ def soft_checks(conn, tb: pd.DataFrame, company: str, fy: int) -> List[str]:
         if not a:
             continue
         is_side = is_income_statement(r.FSLine, a.AccountType)
-        qbv = round(act.get(a.ChartAccountID, 0.0) if is_side else bal.get(a.ChartAccountID, 0.0), 2)
+        # Retained earnings: QuickBooks' GL closes the year's profit into it at year end; M&Co's TB shows it
+        # before the current year's profit, so compare with QuickBooks' opening balance for the year.
+        is_re = "retained earnings" in (a.AccountName or "").lower()
+        if is_side:
+            qbv, basis = act.get(a.ChartAccountID, 0.0), "FY activity"
+        elif is_re:
+            qbv, basis = opening.get(a.ChartAccountID, 0.0), "opening balance"
+        else:
+            qbv, basis = bal.get(a.ChartAccountID, 0.0), "Aug 31 balance"
+        qbv = round(qbv, 2)
         if abs(round(r.Prelim - qbv, 2)) > TOL:
             notes.append(f"6 {r.AccountNo} {r.AccountName or ''}: Prelim {r.Prelim:,.2f} vs QuickBooks {qbv:,.2f} "
-                         f"({'FY activity' if is_side else 'Aug 31 balance'}) -> {r.Prelim - qbv:+,.2f}")
+                         f"({basis}) -> {r.Prelim - qbv:+,.2f}")
         else:
             n_ok += 1
     notes.append(f"6: {n_ok} of {len(tb) - len(not_in_qb)} QuickBooks accounts agree with Prelim to the cent")
     return notes
+
+
+def _records(df: pd.DataFrame, **fixed) -> List[dict]:
+    """Rows for SQL: pandas may hand back NaN for an empty cell even after it was set to None, and SQL Server
+    rejects NaN ("Numeric value out of range"), so every NaN becomes NULL here."""
+    out = []
+    for r in df.to_dict("records"):
+        out.append({k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in r.items()} | fixed)
+    return out
 
 
 def save(conn, tb: pd.DataFrame, aje: pd.DataFrame, company: str, fy: int) -> Tuple[int, int, int, int]:
@@ -265,13 +286,13 @@ def save(conn, tb: pd.DataFrame, aje: pd.DataFrame, company: str, fy: int) -> Tu
                                         Description, IsRollForward, SourceDoc)
             VALUES (:Company, :FiscalYearEnd, :AJENumber, :EntryDate, :AccountNo, :AccountName, :Debit, :Credit,
                     :Description, :IsRollForward, :SourceDoc)"""),
-            [dict(r, Company=company, FiscalYearEnd=fy) for r in aje.to_dict("records")])
+            _records(aje, Company=company, FiscalYearEnd=fy))
     conn.execute(text("""
         INSERT INTO fin.YearEndTB (Company, FiscalYearEnd, AccountNo, AccountName, FSLine, Prelim, Adj, Reclass, Final,
                                    PriorYearFinal, Annotation, SourceDoc)
         VALUES (:Company, :FiscalYearEnd, :AccountNo, :AccountName, :FSLine, :Prelim, :Adj, :Reclass, :Final,
                 :PriorYearFinal, :Annotation, :SourceDoc)"""),
-        [dict(r, Company=company, FiscalYearEnd=fy) for r in tb.to_dict("records")])
+        _records(tb, Company=company, FiscalYearEnd=fy))
     return d_tb, d_aje, len(tb), len(aje)
 
 
@@ -306,9 +327,9 @@ def main():
     ap.add_argument("--company", choices=COMPANIES)
     ap.add_argument("--fy", type=int, help="fiscal year END, e.g. 2025 = Sep 1 2024 - Aug 31 2025")
     ap.add_argument("--all", action="store_true", help="every company x year whose TB file exists")
-    ap.add_argument("--tb", help="TB CSV (default: C:\\NM\\<FY>yearend\\<co>\\accountant\\YearEndTB_<co>_<FY>.csv)")
+    ap.add_argument("--tb", help="TB CSV (default: C:\\NM\\accountant\\<co>\\YearEndTB_<co>_<FY>.csv)")
     ap.add_argument("--aje", help="AJE CSV (default: same folder, YearEndAJE_<co>_<FY>.csv)")
-    ap.add_argument("--base", default=BASE, help="root folder holding the <FY>yearend folders")
+    ap.add_argument("--base", default=BASE, help="folder holding one sub-folder per company (default C:\\NM\\accountant)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -316,7 +337,7 @@ def main():
         jobs = [(co, fy) for fy in range(2018, date.today().year + 2) for co in COMPANIES
                 if os.path.exists(default_path("TB", co, fy, args.base))]
         if not jobs:
-            raise SystemExit(f"No YearEndTB_<co>_<FY>.csv found under {args.base}\\<FY>yearend\\<co>\\accountant")
+            raise SystemExit(f"No YearEndTB_<co>_<FY>.csv found under {args.base}\\<co>")
     elif args.company and args.fy:
         jobs = [(args.company, args.fy)]
     else:

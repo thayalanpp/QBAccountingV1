@@ -32,31 +32,52 @@ Run order: AFTER run_qb_load.py for the company (a QB reload deletes and
 rewrites that year's qb.AccountBalances with a 0 opening), BEFORE
 split_pipeline.py.
 
-    python load_gl_balances.py --company dntl --dry-run
-    python load_gl_balances.py --company dntl
+    python load_gl_balances.py --company dntl --fy 2026 --dry-run
+    python load_gl_balances.py --company dntl --fy 2026
+    python load_gl_balances.py --company hyg  --fy 2026
+
+The GL file is found from the company and year (see GL_FILE below):
+    C:\\NM\\quickbooks\\dntl\\qb dntl gl 2026.xlsx
+    C:\\NM\\quickbooks\\hyg\\qb hyg gl 2026.xlsx
+--gl "<path>" still overrides it for a one-off file.
+
+One-year GL files also work (QuickBooks can drop rows in multi-year exports):
+run once per year file; each run saves that year's opening and closing.
+Checkpoints are checked only for the Aug 31 dates the file covers.
+A balance-sheet account with no rows in the file (no activity) takes the balance
+QuickBooks shows on its header line. Only an account missing from the file
+altogether keeps the previous year's closing from an earlier GL load.
+
 """
 
 import argparse
+import os
 import sys
 from datetime import date
 
 from sqlalchemy import text
 
+import pandas as pd
+
 from qb_loader import (
     get_engine, parse_transaction_detail, validate_section, parse_account_list,
-    fiscal_period, _account_number_from_label, _to_date,
+    fiscal_period, _account_number_from_label, _to_date, _find_header_row, _cell,
 )
 
-GL_FILES = {
-    "dntl": r"C:\NM\quickbooks\dntl\qb sv gl 2020-2026.xlsx",
-}
+# The fiscal year to load (named by the year it ends) - same as FISCAL_YEAR_END in run_qb_load.py.
+FISCAL_YEAR_END = 2026
+
+# One GL export per company per year: C:\NM\quickbooks\<company>\qb <company> gl <year>.xlsx
+GL_FILE = r"C:\NM\quickbooks\{company}\qb {company} gl {year}.xlsx"
 
 # Known balances, debit + / credit - as the export shows them (board: "Dental's key accounts", multi-year GL).
 CHECKPOINTS = {
     "dntl": {
         "10000": {2023: 13263.95, 2024: 65468.68, 2025: 13103.87},
-        "22200": {2023: 9502.48, 2024: 12466.03, 2025: 35260.97},
-        "22100": {2023: -7646.88, 2024: -7646.88, 2025: -7646.88},
+        # 2023-2025: after M&Co's year-end entries, as posted by the bookkeeper (Oct 2026) -
+        # equal to M&Co's final trial balances (FY2023 = PriorYearFinal on the FY2024 TB).
+        "22200": {2023: 5556.90, 2024: 8520.45, 2025: -408.99},
+        "22100": {2023: -19376.26, 2024: -19376.26, 2025: 12348.12},
         "22150": {2023: 12500.00, 2024: 12500.00, 2025: 12500.00},
     },
 }
@@ -79,6 +100,31 @@ def balance_at(section, opening, as_of: date) -> float:
     return round(bal, 2)
 
 
+def header_balances(gl_path):
+    """Balance shown on each account's header line in the GL - QuickBooks puts the
+    balance brought forward there. For an account with no rows in the file (no
+    activity), that is its balance for the whole period."""
+    df = pd.read_excel(gl_path, sheet_name="Sheet1", header=None)
+    header_row, col_map = _find_header_row(df)
+    type_col = col_map["Type"]
+    out = {}
+    for i in range(header_row + 1, len(df)):
+        row = df.iloc[i]
+        if _cell(row, col_map, "Type") is not None:
+            continue
+        label = None
+        for c in range(0, type_col):
+            v = row[c] if c in row.index else None
+            if pd.notna(v):
+                label = str(v).strip()
+        if not label or label.startswith("Total "):
+            continue
+        bal = _cell(row, col_map, "Balance")
+        if bal is not None and not pd.isna(bal):
+            out[_account_number_from_label(label)] = round(float(bal), 2)
+    return out
+
+
 def account_types_from_db(engine, company_id):
     with engine.connect() as conn:
         rows = conn.execute(
@@ -92,10 +138,11 @@ def account_types_from_file(path):
     return {r.account_number: (r.account_type, None) for r in parse_account_list(path)}
 
 
-def build_balances(gl_path, types, first_fy=None, last_fy=None):
+def build_balances(gl_path, types, first_fy=None, last_fy=None, start_month=9):
     """Returns (balances {acct: {fy: debit+ closing}}, problems [str], meta)."""
     sections = parse_transaction_detail(gl_path)
-    problems, balances, skipped_unknown = [], {}, []
+    headers = header_balances(gl_path)
+    problems, balances, skipped_unknown, from_header = [], {}, [], []
 
     dates = [d for s in sections for r in s.rows if (d := _to_date(r.txn_date))]
     if not dates:
@@ -108,16 +155,20 @@ def build_balances(gl_path, types, first_fy=None, last_fy=None):
     fys = list(range(fy_lo - 1, fy_hi + 1))   # fy_lo-1 = opening of the first year
 
     for s in sections:
-        if not s.rows:
-            continue
         num = _account_number_from_label(s.account_label)
         acct_type = (types.get(num) or ("Unknown", None))[0]
         t = acct_type.strip().lower()
+        if t not in BALANCE_SHEET and t != "unknown":
+            continue    # income / expense / non-posting: not taken from the multi-year GL
+        if not s.rows:
+            # No activity in the file: the header line's brought-forward balance holds all period.
+            if num in headers and t != "unknown":
+                balances[num] = {fy: headers[num] + 0.0 for fy in fys}
+                from_header.append(num)
+            continue
         if t == "unknown":
             skipped_unknown.append(num)
             continue
-        if t not in BALANCE_SHEET:
-            continue    # income / expense / non-posting: not taken from the multi-year GL
         ds = [d for r in s.rows if (d := _to_date(r.txn_date))]
         if any(b < a for a, b in zip(ds, ds[1:])):
             problems.append(f"{s.account_label}: rows not in date order - balance at a date is ambiguous")
@@ -127,16 +178,25 @@ def build_balances(gl_path, types, first_fy=None, last_fy=None):
             problems.append(f"{s.account_label}: running balance breaks at sheet row {v.first_mismatch_row + 1} "
                             f"(computed {v.computed_ending:,.2f} vs shown {v.stated_ending:,.2f})")
             continue
-        balances[num] = {fy: round(balance_at(s, v.opening_balance, fiscal_period(fy).end), 2) + 0.0 for fy in fys}
+        if num in headers and abs(headers[num] - v.opening_balance) > 0.005:
+            problems.append(f"{s.account_label}: header balance {headers[num]:,.2f} vs opening re-derived from rows "
+                            f"{v.opening_balance:,.2f}")
+            continue
+        balances[num] = {fy: round(balance_at(s, v.opening_balance, fiscal_period(fy, start_month).end), 2) + 0.0
+                         for fy in fys}
 
     return balances, problems, {"first_date": first_date, "last_date": last_date, "fys": fys,
-                                "unknown": skipped_unknown}
+                                "unknown": skipped_unknown, "from_header": from_header}
 
 
-def check_points(company, balances):
+def check_points(company, balances, fys):
+    """Known balances must agree - only for the Aug 31 dates this GL file covers
+    (a one-year GL covers its opening and closing Aug 31 only)."""
     problems = []
     for num, by_fy in CHECKPOINTS.get(company, {}).items():
         for fy, expected in by_fy.items():
+            if fy not in fys:
+                continue
             got = balances.get(num, {}).get(fy)
             if got is None:
                 problems.append(f"checkpoint {num} Aug 31 {fy}: no balance computed (expected {expected:,.2f})")
@@ -165,6 +225,30 @@ def check_movements(engine, company_id, balances, types, fys):
     return problems, compared
 
 
+def carry_forward_dormant(engine, company_id, balances, types, fys):
+    """One-year GL: a balance-sheet account with no rows in the file had no activity that
+    year, so its balance is unchanged - take the opening from the previous year's closing
+    saved by an earlier GL load (SourceFile is a GL file). Run yearly files oldest first."""
+    if len(fys) != 2:
+        return []
+    prev_fy = fys[0]
+    with engine.connect() as conn:
+        rows = conn.execute(text("""SELECT ChartAccountID, ClosingBalance FROM qb.AccountBalances
+                                    WHERE CompanyID = :c AND FiscalYearEnd = :fy
+                                      AND LOWER(SourceFile) LIKE '%gl%'"""),
+                            {"c": company_id, "fy": prev_fy}).fetchall()
+    prev_close = {r[0]: round(float(r[1]), 2) for r in rows}
+    carried = []
+    for num, (acct_type, aid) in types.items():
+        if num in balances or aid not in prev_close:
+            continue
+        if (acct_type or "").strip().lower() not in BALANCE_SHEET:
+            continue
+        balances[num] = {fy: prev_close[aid] for fy in fys}
+        carried.append(num)
+    return carried
+
+
 def save(engine, company_id, balances, types, fys, gl_path):
     sql = text("""
         MERGE qb.AccountBalances AS t
@@ -185,39 +269,56 @@ def save(engine, company_id, balances, types, fys, gl_path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--company", default="dntl")
-    ap.add_argument("--gl", help="multi-year GL export (default: GL_FILES[company])")
+    ap.add_argument("--fy", type=int, default=FISCAL_YEAR_END,
+                    help=f"fiscal year of the GL file, named by the year it ends (default {FISCAL_YEAR_END})")
+    ap.add_argument("--gl", help="GL export to use instead of the default file for --company and --fy "
+                                 "(a multi-year file: also pass --first-fy/--last-fy, or leave both out to take every year)")
     ap.add_argument("--account-list", help="Account Listing export - account types without the DB (dry run)")
     ap.add_argument("--first-fy", type=int)
     ap.add_argument("--last-fy", type=int)
     ap.add_argument("--dry-run", action="store_true", help="parse, check and print; no writes")
     args = ap.parse_args()
 
-    gl = args.gl or GL_FILES.get(args.company)
-    if not gl:
-        sys.exit(f"No GL file for {args.company} - pass --gl")
+    if args.gl:
+        gl = args.gl
+    else:
+        gl = GL_FILE.format(company=args.company, year=args.fy)
+        # The default file holds one fiscal year - take exactly that year, even if
+        # the last row is dated before Aug 31.
+        args.first_fy = args.first_fy or args.fy
+        args.last_fy = args.last_fy or args.fy
+    if not os.path.exists(gl):
+        sys.exit(f"GL file not found: {gl}")
 
     engine = company_id = None
+    start_month = 9
     if args.account_list:
         types = account_types_from_file(args.account_list)
     else:
         engine = get_engine()
         with engine.connect() as conn:
-            row = conn.execute(text("SELECT CompanyID FROM qb.Companies WHERE CompanyCode = :c"),
+            row = conn.execute(text("SELECT CompanyID, FiscalYearStartMonth FROM qb.Companies WHERE CompanyCode = :c"),
                                {"c": args.company}).fetchone()
         if not row:
             sys.exit(f"Company {args.company} not in qb.Companies - run run_qb_load.py first")
         company_id = row[0]
+        start_month = int(row[1] or 9)
         types = account_types_from_db(engine, company_id)
 
-    balances, problems, meta = build_balances(gl, types, args.first_fy, args.last_fy)
-    problems += check_points(args.company, balances)
+    balances, problems, meta = build_balances(gl, types, args.first_fy, args.last_fy, start_month)
     fys = meta["fys"]
+    carried = carry_forward_dormant(engine, company_id, balances, types, fys) if engine is not None else []
+    problems += check_points(args.company, balances, fys)
 
     print(f"GL {gl}\n  rows dated {meta['first_date']} .. {meta['last_date']}; "
           f"FY{fys[1]}..FY{fys[-1]} (debit +, credit -)")
     print(f"  {'Account':<10}" + "".join(f"{'Aug 31 ' + str(y):>16}" for y in fys))
     for num in sorted(balances):
         print(f"  {num:<10}" + "".join(f"{balances[num][y]:>16,.2f}" for y in fys))
+    if meta["from_header"]:
+        print(f"  no activity in the file - balance from the GL header line: {', '.join(sorted(meta['from_header']))}")
+    if carried:
+        print(f"  not in the file - balance carried from FY{fys[0]}'s GL load: {', '.join(sorted(carried))}")
     if meta["unknown"]:
         print(f"  skipped (account type 'Unknown' - not in the Account Listing): {', '.join(meta['unknown'])}")
 

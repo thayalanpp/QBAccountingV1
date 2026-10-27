@@ -98,6 +98,20 @@ Agreed with the bookkeeper (Shaju Paul CPA):
 The Aug 2024 sheet's cheque (C8 9,525.04, cheque 23, paid Sep 3 2024) means Dental owed Hygiene 9,525.04 at Aug 31 2024 with nothing recorded. That accrual is a **22100 / expense cut-off matter**, not a 22200 error, and is **not** part of JE-1 to JE-7.
 (The 22200 effect of year-end cheque timing - about 1,617.66 net - is one of the parts of the remaining 1,600.96; see "FY2025: 1,600.96 still to explain".)
 
+### Balanced Arch Dental is a dental lab
+*owner · Decision · split · dntl · FY2025*
+
+Owner confirmed (Oct 2026): **Balanced Arch Dental** is a dental lab, not a supplier. QuickBooks codes its Visa charges to 64400 Dental Supplies.
+| | FY2024 | FY2025 |
+|---|---|---|
+| Balanced Arch in supplies | 8,601.25 | 15,312.50 |
+| Lab fees reported (63600, all cheques) | 9,396.62 | 6,439.00 |
+FY2025 lab fees corrected = 6,439.00 + 15,312.50 + Align 3,534.52 (JE-6) = **25,286.02**; supplies falls to 37,040.68. Profit is unchanged (classification only).
+Split effect: lab work is 100% Dental. If Balanced Arch went through the 80/20 split, Hygiene's 20% (about 3,062.50 FY2025, 1,720.25 FY2024) belongs in the year-end lab adjustment. **Check:** is Balanced Arch on the lab list (D6) in NM_2024.xlsx / NM_2025.xlsx? If not, it is part of the further 3,967.90 question and the answer is "yes, a real lab". Bio Dent Lab (1,099.88 FY2025) is probably a lab too - confirm.
+Going forward: bookkeeper codes Balanced Arch to the "Lab fees - Visa" account (set it as the vendor's default account in QuickBooks).
+
+_Evidence: qb.JournalEntryLines 64400/63600 by vendor FY2024-FY2025; fin.YearEndTB dntl 2025_
+
 ## build_agent - how the application works
 
 ### Application: pipelines and files
@@ -183,7 +197,7 @@ M&Co's adjusting entries never reach QuickBooks, so their figures are loaded alo
 | fin.vw_YearEndTB_vs_QB | Each TB line vs QuickBooks at the year end (balance sheet: AccountBalances closing; P&L: the year's activity) |
 | fin.vw_YearEndCarryForward | Balance-sheet Final vs QuickBooks closing: the cumulative adjustment never posted to QuickBooks |
 | fin.vw_YearEndFSLines | Final by statement line, plus a Net income row, to compare with the PDF statements |
-Files: C:\NM\<FY>yearend\<co>\accountant\YearEndTB_<co>_<FY>.csv and YearEndAJE_<co>_<FY>.csv (CSVs prepared from the PDFs; the loader does not read PDFs).
+Files: C:\NM\accountant\<co>\YearEndTB_<co>_<FY>.csv and YearEndAJE_<co>_<FY>.csv, all years in one folder per company, with the PDFs (CSVs prepared from the PDFs; the loader does not read PDFs).
 FY2025 Dental: 36 TB rows, 6 AJEs (17 lines, 209,368.21 each side), CC group Final 25,137.22, net income 47,997.35. No IIF of AJEs until it is decided whether to record them.
 
 ## dental_agent - facts and findings

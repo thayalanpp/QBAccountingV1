@@ -1107,7 +1107,9 @@ GO
 -- fin.vw_YearEndTB_vs_QB: each accountant TB line next to QuickBooks at the same year end.
 --   Side       'BS' balance sheet / 'IS' income statement - from the FSLine (M&Co's balance-sheet
 --              lines start with a letter, income-statement lines with a number), else from the QB type
---   QBAmount   BS: qb.AccountBalances closing; IS: sum of qb.JournalEntryLines in the fiscal year
+--   QBAmount   BS: qb.AccountBalances closing; IS: sum of qb.JournalEntryLines in the fiscal year;
+--              Retained Earnings: the year's OPENING balance - QuickBooks' GL closes the year's profit into
+--              it at year end, while M&Co's TB shows retained earnings before the current year's profit
 --   InQB       0 = account is not in this company's QuickBooks chart (M&Co-only, e.g. 5000, 22201, 90000)
 --   QBYearLoaded 0 = QuickBooks has no data for that fiscal year, so QBAmount means nothing
 --   PrelimLessQB  Prelim - QBAmount; non-zero = QuickBooks changed since the accountant's copy, or a mapping
@@ -1141,6 +1143,10 @@ OUTER APPLY (SELECT TOP 1 1 AS Loaded FROM qb.AccountBalances b
 OUTER APPLY (
     SELECT CAST(CASE
         WHEN coa.ChartAccountID IS NULL OR yl.Loaded IS NULL THEN NULL
+        WHEN side.Side = 'BS' AND coa.AccountName LIKE '%Retained Earnings%'
+             THEN COALESCE((SELECT b.OpeningBalance FROM qb.AccountBalances b
+                            WHERE b.CompanyID = c.CompanyID AND b.ChartAccountID = coa.ChartAccountID
+                              AND b.FiscalYearEnd = t.FiscalYearEnd), 0)
         WHEN side.Side = 'BS' THEN COALESCE((SELECT b.ClosingBalance FROM qb.AccountBalances b
                                              WHERE b.CompanyID = c.CompanyID AND b.ChartAccountID = coa.ChartAccountID
                                                AND b.FiscalYearEnd = t.FiscalYearEnd), 0)

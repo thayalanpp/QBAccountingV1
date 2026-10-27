@@ -31,8 +31,12 @@ By default a reload is refused (nothing changes) if any account section
 in the export fails its running-balance check. --allow-partial reloads
 anyway, leaving the failed accounts with no rows for that year.
 
-File paths are built from the year: C:\\NM\\2025yearend\\quickbooks\\... for
-FY2025, C:\\NM\\2026yearend\\... for FY2026 (see YEAR_END_ROOT below).
+Files live in one folder per company, for every year (see QB_ROOT below):
+    C:\\NM\\quickbooks\\dntl\\qb dntl all transaction 2026 - account list.xlsx
+    C:\\NM\\quickbooks\\dntl\\qb dntl all transaction 2026 - transaction detail.xlsx
+    C:\\NM\\quickbooks\\hyg\\qb hyg all transaction 2026 - account list.xlsx
+    C:\\NM\\quickbooks\\hyg\\qb hyg all transaction 2026 - transaction detail.xlsx
+The year in the file name comes from FISCAL_YEAR_END (or --fy-end).
 
 In PyCharm: set FISCAL_YEAR_END below and click Run, or
 put the flags under Run/Debug Configuration -> Parameters.
@@ -46,42 +50,33 @@ from qb_loader import get_engine, load_company
 from sql_helper import ensure_schema
 
 # The fiscal year the bookkeeper is currently working on.
-FISCAL_YEAR_END = 2025
+FISCAL_YEAR_END = 2026
 
-# Each year's exports live in their own folder: C:\NM\<year>yearend\quickbooks\...
-# {year} below is filled in from FISCAL_YEAR_END (or --fy-end), so changing
-# the year also switches the folder and file names - they can't get out of sync.
-YEAR_END_ROOT = r"C:\NM\{year}yearend\quickbooks"
+# All QuickBooks exports for a company live in one folder, every year:
+#   C:\NM\quickbooks\<company>\qb <company> all transaction <year> - account list.xlsx
+#   C:\NM\quickbooks\<company>\qb <company> all transaction <year> - transaction detail.xlsx
+# {company} and {year} are filled in when the script runs, so changing the year
+# switches the file names - they can't get out of sync.
+QB_ROOT = r"C:\NM\quickbooks\{company}"
+ACCOUNT_LIST = QB_ROOT + r"\qb {company} all transaction {year} - account list.xlsx"
+TRANSACTION_DETAIL = QB_ROOT + r"\qb {company} all transaction {year} - transaction detail.xlsx"
 
-# Leave paths as "" for a company you haven't gotten to yet - it's skipped.
+# Set "load": False for a company you haven't gotten to yet - it's skipped.
 COMPANIES = [
-    {
-        "company": "dntl",
-        "legal_name": "S. Viswanathan Dentistry Professional Corporation",
-        "account_list": YEAR_END_ROOT + r"\dntl\qb sv all transaction {year} - account list.xlsx",
-        "transaction_detail": YEAR_END_ROOT + r"\dntl\qb sv all transaction {year} - transaction detail.xlsx",
-    },
-    {
-        "company": "hyg",
-        "legal_name": "DHM Dental Hygiene Technical Services Corporation",
-        "account_list": YEAR_END_ROOT + r"\hyg\qb hyg all transaction {year} - account list.xlsx",
-        "transaction_detail": YEAR_END_ROOT + r"\hyg\qb hyg all transaction {year} - transaction detail.xlsx",
-    },
-    {
-        "company": "mgmt",
-        "legal_name": "",
-        "account_list": YEAR_END_ROOT + r"\mgmt\qb mgmt all transaction {year} - account list.xlsx",
-        "transaction_detail": YEAR_END_ROOT + r"\mgmt\qb mgmt all transaction {year} - transaction detail.xlsx",
-    },
+    {"company": "dntl", "legal_name": "S. Viswanathan Dentistry Professional Corporation", "load": True},
+    {"company": "hyg", "legal_name": "DHM Dental Hygiene Technical Services Corporation", "load": True},
+    {"company": "mgmt", "legal_name": "", "load": True},
 ]
 
 
 def _paths_for_year(job, year):
-    """Fill {year} into a COMPANIES entry's file paths."""
+    """File paths for a COMPANIES entry and year (empty if the company is switched off)."""
     job = dict(job)
-    for key in ("account_list", "transaction_detail"):
-        if job.get(key):
-            job[key] = job[key].format(year=year)
+    if job.get("load", True):
+        job["account_list"] = ACCOUNT_LIST.format(company=job["company"], year=year)
+        job["transaction_detail"] = TRANSACTION_DETAIL.format(company=job["company"], year=year)
+    else:
+        job["account_list"] = job["transaction_detail"] = ""
     return job
 
 
@@ -127,7 +122,7 @@ def main():
     results = []
     for job in jobs:
         if not job.get("account_list") or not job.get("transaction_detail"):
-            print(f"⏭️  {job['company']}: no file paths set yet, skipping")
+            print(f"⏭️  {job['company']}: switched off in COMPANIES, skipping")
             continue
         print(f"\n=== {job['company']} - FY{args.fy_end}{' (dry run)' if args.dry_run else ''} ===")
         missing = [p for p in (job["account_list"], job["transaction_detail"]) if not os.path.exists(p)]
